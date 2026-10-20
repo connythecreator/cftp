@@ -18,7 +18,10 @@ fn reports_version_and_help() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("cftp 0.1.0"));
+        .stdout(predicate::str::contains(format!(
+            "cftp {}",
+            env!("CARGO_PKG_VERSION")
+        )));
 
     cftp()
         .arg("--help")

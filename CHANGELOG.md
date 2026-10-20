@@ -7,6 +7,13 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-20
+
+### Changed
+
+- Pack building, chunk compression, sending, and receiving now use bounded
+  parallelism instead of processing one item or stream at a time.
+
 ## [0.1.0] - 2026-10-20
 
 ### Added
@@ -41,5 +48,6 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Received paths are normalized and confined to the destination root.
 - Files are written to temporary files and renamed into place after completion.
 
-[Unreleased]: https://github.com/connythecreator/cftp/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/connythecreator/cftp/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/connythecreator/cftp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/connythecreator/cftp/releases/tag/v0.1.0

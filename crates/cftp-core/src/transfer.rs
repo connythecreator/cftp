@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -13,7 +15,7 @@ use cftp_proto::{
 };
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::codec::{self, CHUNK_LEVEL, PACK_LEVEL};
 use crate::identity::{DEFAULT_SERVER_NAME, Identity};
@@ -148,8 +150,9 @@ pub async fn push(
     let mut stats = PushStats::default();
     let mut state = SendState::default();
 
-    let (tx, mut rx) = mpsc::channel::<Result<EncodedItem>>(8);
+    let (tx, mut rx) = mpsc::channel::<Result<EncodedItem>>(MAX_INFLIGHT_SENDS);
     let producer = tokio::spawn(produce_items(scan.clone(), opts.clone(), tx));
+    let mut sends = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             biased;
@@ -164,14 +167,47 @@ pub async fn push(
                     None => bail!("server closed control stream before completion"),
                 }
             }
+            result = sends.join_next(), if !sends.is_empty() => {
+                let result = result.expect("send set is not empty");
+                apply_sent_item(
+                    result.context("send task panicked")??,
+                    &mut stats,
+                    &mut state,
+                    &opts,
+                    totals,
+                );
+                drain_server_messages(&mut server_rx, &mut state, &opts, totals)?;
+            }
             item = rx.recv() => {
                 let Some(item) = item else {
                     break;
                 };
-                send_item(&connection, item?, &opts, totals, &mut stats, &mut state).await?;
-                drain_server_messages(&mut server_rx, &mut state, &opts, totals)?;
+                let item = item?;
+                while sends.len() >= MAX_INFLIGHT_SENDS {
+                    let result = sends.join_next().await.expect("send set is not empty");
+                    apply_sent_item(
+                        result.context("send task panicked")??,
+                        &mut stats,
+                        &mut state,
+                        &opts,
+                        totals,
+                    );
+                    drain_server_messages(&mut server_rx, &mut state, &opts, totals)?;
+                }
+                let connection = connection.clone();
+                sends.spawn(async move { send_item(&connection, item).await });
             }
         }
+    }
+    while let Some(result) = sends.join_next().await {
+        apply_sent_item(
+            result.context("send task panicked")??,
+            &mut stats,
+            &mut state,
+            &opts,
+            totals,
+        );
+        drain_server_messages(&mut server_rx, &mut state, &opts, totals)?;
     }
     producer.await.context("producer task panicked")?;
 
@@ -210,6 +246,9 @@ pub async fn push(
     control_send.finish()?;
     Ok(stats)
 }
+
+const MAX_INFLIGHT_SENDS: usize = 32;
+const MAX_INFLIGHT_STREAMS: usize = 32;
 
 #[derive(Debug, Default)]
 struct SendState {
@@ -298,6 +337,11 @@ async fn produce_items_inner(
     opts: PushOptions,
     tx: &mpsc::Sender<Result<EncodedItem>>,
 ) -> Result<()> {
+    let parallelism = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let permits = Arc::new(Semaphore::new(parallelism));
+    let mut tasks = tokio::task::JoinSet::new();
     let mut pack_entries = Vec::new();
     let mut pack_bytes = 0u64;
     let mut pack_id = 0u64;
@@ -311,25 +355,63 @@ async fn produce_items_inner(
             pack_bytes = pack_bytes.saturating_add(entry.size);
             pack_entries.push(entry.clone());
             if pack_bytes >= opts.pack_target as u64 || pack_entries.len() >= opts.pack_max_files {
-                enqueue_pack(&scan.base, &mut pack_entries, &mut pack_id, tx).await?;
+                enqueue_pack(
+                    &mut tasks,
+                    &permits,
+                    &scan.base,
+                    &mut pack_entries,
+                    &mut pack_id,
+                    tx,
+                )
+                .await?;
                 pack_bytes = 0;
             }
         } else {
             if !pack_entries.is_empty() {
-                enqueue_pack(&scan.base, &mut pack_entries, &mut pack_id, tx).await?;
+                enqueue_pack(
+                    &mut tasks,
+                    &permits,
+                    &scan.base,
+                    &mut pack_entries,
+                    &mut pack_id,
+                    tx,
+                )
+                .await?;
                 pack_bytes = 0;
             }
-            enqueue_large(&scan.base, entry, &opts, tx).await?;
+            enqueue_large(&mut tasks, &permits, &scan.base, entry, &opts, tx).await?;
         }
+        drain_encoding_tasks(&mut tasks)?;
     }
 
     if !pack_entries.is_empty() {
-        enqueue_pack(&scan.base, &mut pack_entries, &mut pack_id, tx).await?;
+        enqueue_pack(
+            &mut tasks,
+            &permits,
+            &scan.base,
+            &mut pack_entries,
+            &mut pack_id,
+            tx,
+        )
+        .await?;
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result.context("encoding task panicked")??;
+    }
+    Ok(())
+}
+
+fn drain_encoding_tasks(tasks: &mut tokio::task::JoinSet<Result<()>>) -> Result<()> {
+    while let Some(result) = tasks.try_join_next() {
+        result.context("encoding task panicked")??;
     }
     Ok(())
 }
 
 async fn enqueue_pack(
+    tasks: &mut tokio::task::JoinSet<Result<()>>,
+    permits: &Arc<Semaphore>,
     base: &Path,
     entries: &mut Vec<ManifestEntry>,
     pack_id: &mut u64,
@@ -342,15 +424,26 @@ async fn enqueue_pack(
     let base = base.to_path_buf();
     let id = *pack_id;
     *pack_id += 1;
-    let built = tokio::task::spawn_blocking(move || build_pack(base, entries, id)).await??;
-    tx.send(Ok(EncodedItem::Pack {
-        header: built.header,
-        payload: built.payload,
-        logical_bytes: built.logical_bytes,
-        files: built.files,
-    }))
-    .await
-    .map_err(|_| anyhow::anyhow!("send pipeline closed"))
+    let permit = permits
+        .clone()
+        .acquire_owned()
+        .await
+        .context("encoding semaphore closed")?;
+    let tx = tx.clone();
+    tasks.spawn(async move {
+        let _permit = permit;
+        let built = tokio::task::spawn_blocking(move || build_pack(base, entries, id)).await??;
+        tx.send(Ok(EncodedItem::Pack {
+            header: built.header,
+            payload: built.payload,
+            logical_bytes: built.logical_bytes,
+            files: built.files,
+        }))
+        .await
+        .map_err(|_| anyhow::anyhow!("send pipeline closed"))?;
+        Ok(())
+    });
+    Ok(())
 }
 
 fn build_pack(base: PathBuf, entries: Vec<ManifestEntry>, pack_id: u64) -> Result<BuiltPack> {
@@ -398,6 +491,8 @@ fn build_pack(base: PathBuf, entries: Vec<ManifestEntry>, pack_id: u64) -> Resul
 }
 
 async fn enqueue_large(
+    tasks: &mut tokio::task::JoinSet<Result<()>>,
+    permits: &Arc<Semaphore>,
     base: &Path,
     entry: &ManifestEntry,
     opts: &PushOptions,
@@ -412,6 +507,11 @@ async fn enqueue_large(
     let allow_skip = !codec::extension_is_incompressible(&entry.path);
 
     loop {
+        let permit = permits
+            .clone()
+            .acquire_owned()
+            .await
+            .context("encoding semaphore closed")?;
         let read = file
             .read(&mut buffer)
             .await
@@ -421,32 +521,40 @@ async fn enqueue_large(
         }
         let data = buffer[..read].to_vec();
         let done = offset + read as u64 == entry.size;
-        let (hash, chunk_codec, encoded) = tokio::task::spawn_blocking(move || {
-            let hash = codec::hash(&data);
-            let (chunk_codec, encoded) = if allow_skip {
-                codec::compress(&data, CHUNK_LEVEL, true)?
-            } else {
-                (Codec::Raw, data)
+        let file_id = entry.id;
+        let tx = tx.clone();
+        let chunk_offset = offset;
+        let chunk_len = read;
+        tasks.spawn(async move {
+            let _permit = permit;
+            let (hash, chunk_codec, encoded) = tokio::task::spawn_blocking(move || {
+                let hash = codec::hash(&data);
+                let (chunk_codec, encoded) = if allow_skip {
+                    codec::compress(&data, CHUNK_LEVEL, true)?
+                } else {
+                    (Codec::Raw, data)
+                };
+                Ok::<_, anyhow::Error>((hash, chunk_codec, encoded))
+            })
+            .await??;
+            let header = ChunkHeader {
+                file_id,
+                offset: chunk_offset,
+                uncompressed_len: chunk_len as u32,
+                compressed_len: encoded.len() as u32,
+                codec: chunk_codec,
+                hash,
             };
-            Ok::<_, anyhow::Error>((hash, chunk_codec, encoded))
-        })
-        .await??;
-        let header = ChunkHeader {
-            file_id: entry.id,
-            offset,
-            uncompressed_len: read as u32,
-            compressed_len: encoded.len() as u32,
-            codec: chunk_codec,
-            hash,
-        };
-        tx.send(Ok(EncodedItem::Chunk {
-            header,
-            payload: encoded,
-            logical_bytes: read as u64,
-            file_done: done,
-        }))
-        .await
-        .map_err(|_| anyhow::anyhow!("send pipeline closed"))?;
+            tx.send(Ok(EncodedItem::Chunk {
+                header,
+                payload: encoded,
+                logical_bytes: chunk_len as u64,
+                file_done: done,
+            }))
+            .await
+            .map_err(|_| anyhow::anyhow!("send pipeline closed"))?;
+            Ok(())
+        });
         offset += read as u64;
     }
 
@@ -456,14 +564,15 @@ async fn enqueue_large(
     Ok(())
 }
 
-async fn send_item(
-    connection: &Connection,
-    item: EncodedItem,
-    opts: &PushOptions,
-    totals: Totals,
-    stats: &mut PushStats,
-    state: &mut SendState,
-) -> Result<()> {
+struct SentItem {
+    wire_bytes: u64,
+    logical_bytes: u64,
+    files: u64,
+    file_done: bool,
+    pack: bool,
+}
+
+async fn send_item(connection: &Connection, item: EncodedItem) -> Result<SentItem> {
     match item {
         EncodedItem::Pack {
             header,
@@ -476,14 +585,13 @@ async fn send_item(
             cftp_proto::write_frame(&mut stream, &DataHeader::Pack(header)).await?;
             stream.write_all(&payload).await?;
             stream.finish()?;
-
-            stats.files += files;
-            stats.bytes += logical_bytes;
-            stats.packs += 1;
-            state.read_bytes = state.read_bytes.saturating_add(logical_bytes);
-            state.sent_bytes = state.sent_bytes.saturating_add(wire_bytes);
-            state.bytes_done = state.bytes_done.saturating_add(logical_bytes);
-            state.files_done = state.files_done.saturating_add(files);
+            Ok(SentItem {
+                wire_bytes,
+                logical_bytes,
+                files,
+                file_done: false,
+                pack: true,
+            })
         }
         EncodedItem::Chunk {
             header,
@@ -496,22 +604,43 @@ async fn send_item(
             cftp_proto::write_frame(&mut stream, &DataHeader::Chunk(header)).await?;
             stream.write_all(&payload).await?;
             stream.finish()?;
-
-            stats.bytes += logical_bytes;
-            stats.chunks += 1;
-            state.read_bytes = state.read_bytes.saturating_add(logical_bytes);
-            state.sent_bytes = state.sent_bytes.saturating_add(wire_bytes);
-            state.bytes_done = state.bytes_done.saturating_add(logical_bytes);
-            if file_done {
-                stats.files += 1;
-                state.files_done = state.files_done.saturating_add(1);
-            }
+            Ok(SentItem {
+                wire_bytes,
+                logical_bytes,
+                files: 0,
+                file_done,
+                pack: false,
+            })
         }
     }
-    publish_push_progress(opts, state, totals);
-    Ok(())
 }
 
+fn apply_sent_item(
+    item: SentItem,
+    stats: &mut PushStats,
+    state: &mut SendState,
+    opts: &PushOptions,
+    totals: Totals,
+) {
+    stats.bytes += item.logical_bytes;
+    state.read_bytes = state.read_bytes.saturating_add(item.logical_bytes);
+    state.sent_bytes = state.sent_bytes.saturating_add(item.wire_bytes);
+    state.bytes_done = state.bytes_done.saturating_add(item.logical_bytes);
+
+    if item.pack {
+        stats.files += item.files;
+        stats.packs += 1;
+        state.files_done = state.files_done.saturating_add(item.files);
+    } else {
+        stats.chunks += 1;
+        if item.file_done {
+            stats.files += 1;
+            state.files_done = state.files_done.saturating_add(1);
+        }
+    }
+
+    publish_push_progress(opts, state, totals);
+}
 #[derive(Clone, Copy)]
 struct Totals {
     files: u64,
@@ -700,7 +829,7 @@ async fn receive_connection(
     )
     .await?;
 
-    let mut state = ReceiverState {
+    let state = Arc::new(tokio::sync::Mutex::new(ReceiverState {
         root,
         entries,
         rel_paths,
@@ -715,7 +844,7 @@ async fn receive_connection(
         written_bytes: 0,
         started: Instant::now(),
         progress,
-    };
+    }));
     let mut last_progress = Instant::now();
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
@@ -729,22 +858,16 @@ async fn receive_connection(
     });
 
     let mut complete = false;
+    let mut streams = tokio::task::JoinSet::new();
     let result = loop {
-        if complete && state.all_complete() {
-            break Ok(());
-        }
-
-        if complete {
+        if complete && streams.is_empty() {
+            let all_complete = { state.lock().await.all_complete() };
+            if all_complete {
+                break Ok(());
+            }
             match tokio::time::timeout(Duration::from_secs(30), connection.accept_uni()).await {
                 Ok(Ok(stream)) => {
-                    if let Err(err) = state.process_stream(stream).await {
-                        break Err(err);
-                    }
-                    if let Err(err) =
-                        maybe_send_progress(&mut control_send, &state, &mut last_progress).await
-                    {
-                        break Err(err);
-                    }
+                    spawn_receive_task(&mut streams, state.clone(), stream);
                 }
                 Ok(Err(err)) => {
                     break Err(err).context("failed to accept data stream");
@@ -773,17 +896,28 @@ async fn receive_connection(
                     }
                 }
             }
-            stream = connection.accept_uni() => {
-                match stream {
-                    Ok(stream) => {
-                        if let Err(err) = state.process_stream(stream).await {
-                            break Err(err);
-                        }
+            result = streams.join_next(), if !streams.is_empty() => {
+                match result {
+                    Some(Ok(Ok(()))) => {
                         if let Err(err) =
                             maybe_send_progress(&mut control_send, &state, &mut last_progress).await
                         {
                             break Err(err);
                         }
+                    }
+                    Some(Ok(Err(err))) => {
+                        break Err(err);
+                    }
+                    Some(Err(err)) => {
+                        break Err(err).context("receive task panicked");
+                    }
+                    None => {}
+                }
+            }
+            stream = connection.accept_uni(), if streams.len() < MAX_INFLIGHT_STREAMS => {
+                match stream {
+                    Ok(stream) => {
+                        spawn_receive_task(&mut streams, state.clone(), stream);
                     }
                     Err(err) => {
                         break Err(err).context("failed to accept data stream");
@@ -795,29 +929,35 @@ async fn receive_connection(
     control_task.abort();
 
     if let Err(err) = result {
+        streams.abort_all();
         send_server_error(&mut control_send, &err).await;
         return Err(err);
     }
 
-    let done = Done {
-        files: state.files_done,
-        bytes: state.bytes_done,
+    let (done, server_progress) = {
+        let state = state.lock().await;
+        (
+            Done {
+                files: state.files_done,
+                bytes: state.bytes_done,
+            },
+            state.server_progress(),
+        )
     };
-    cftp_proto::write_frame(
-        &mut control_send,
-        &ServerMessage::Progress(state.server_progress()),
-    )
-    .await?;
+    cftp_proto::write_frame(&mut control_send, &ServerMessage::Progress(server_progress)).await?;
     cftp_proto::write_frame(&mut control_send, &ServerMessage::Done(done.clone())).await?;
     control_send.finish()?;
     // Keep the connection alive long enough for the client to read the final
     // message. Dropping the last local handle closes the connection.
     let _ = tokio::time::timeout(Duration::from_secs(3), connection.closed()).await;
-    if let Some(progress) = &state.progress {
-        let _ = progress.send(ProgressEvent::Complete {
-            files: done.files,
-            bytes: done.bytes,
-        });
+    {
+        let state = state.lock().await;
+        if let Some(progress) = &state.progress {
+            let _ = progress.send(ProgressEvent::Complete {
+                files: done.files,
+                bytes: done.bytes,
+            });
+        }
     }
 
     Ok(ServeStats {
@@ -871,19 +1011,108 @@ fn create_manifest_entries(
 
 async fn maybe_send_progress(
     control_send: &mut SendStream,
-    state: &ReceiverState,
+    state: &Arc<tokio::sync::Mutex<ReceiverState>>,
     last: &mut Instant,
 ) -> Result<()> {
     if last.elapsed() < Duration::from_millis(250) {
         return Ok(());
     }
     *last = Instant::now();
-    cftp_proto::write_frame(
-        control_send,
-        &ServerMessage::Progress(state.server_progress()),
-    )
-    .await?;
+    let progress = { state.lock().await.server_progress() };
+    cftp_proto::write_frame(control_send, &ServerMessage::Progress(progress)).await?;
     Ok(())
+}
+
+fn spawn_receive_task(
+    tasks: &mut tokio::task::JoinSet<Result<()>>,
+    state: Arc<tokio::sync::Mutex<ReceiverState>>,
+    stream: RecvStream,
+) {
+    tasks.spawn(async move {
+        let decoded = decode_stream(stream).await?;
+        let mut state = state.lock().await;
+        state.apply(decoded)?;
+        Ok(())
+    });
+}
+
+enum DecodedData {
+    Pack {
+        header: PackHeader,
+        raw: Vec<u8>,
+        entries: Vec<(u64, Range<usize>)>,
+    },
+    Chunk {
+        header: ChunkHeader,
+        raw: Vec<u8>,
+    },
+}
+
+async fn decode_stream(mut stream: RecvStream) -> Result<DecodedData> {
+    let header: DataHeader = cftp_proto::read_frame(&mut stream)
+        .await
+        .context("failed to read data header")?;
+
+    match header {
+        DataHeader::Pack(pack) => {
+            if pack.compressed_len as usize > cftp_proto::MAX_DATA_PAYLOAD {
+                bail!("pack payload too large");
+            }
+            if pack.uncompressed_len as usize > cftp_proto::MAX_DATA_PAYLOAD {
+                bail!("pack expands beyond the maximum payload size");
+            }
+            let mut encoded = vec![0u8; pack.compressed_len as usize];
+            stream.read_exact(&mut encoded).await?;
+            let (pack, raw, entries) = tokio::task::spawn_blocking(move || {
+                let raw = codec::decompress(pack.codec, &encoded, pack.uncompressed_len as usize)?;
+                let mut offset = 0usize;
+                let mut entries = Vec::with_capacity(pack.entries.len());
+                for entry in &pack.entries {
+                    let end = offset
+                        .checked_add(entry.size as usize)
+                        .context("pack size overflow")?;
+                    if end > raw.len() {
+                        bail!("pack entry {} exceeds the payload", entry.file_id);
+                    }
+                    if codec::hash(&raw[offset..end]) != entry.hash {
+                        bail!("hash mismatch for pack entry {}", entry.file_id);
+                    }
+                    entries.push((entry.file_id, offset..end));
+                    offset = end;
+                }
+                if offset != raw.len() {
+                    bail!("pack payload contains trailing bytes");
+                }
+                Ok::<_, anyhow::Error>((pack, raw, entries))
+            })
+            .await??;
+            Ok(DecodedData::Pack {
+                header: pack,
+                raw,
+                entries,
+            })
+        }
+        DataHeader::Chunk(chunk) => {
+            if chunk.compressed_len as usize > cftp_proto::MAX_DATA_PAYLOAD {
+                bail!("chunk payload too large");
+            }
+            if chunk.uncompressed_len as usize > cftp_proto::MAX_DATA_PAYLOAD {
+                bail!("chunk expands beyond the maximum payload size");
+            }
+            let mut encoded = vec![0u8; chunk.compressed_len as usize];
+            stream.read_exact(&mut encoded).await?;
+            let (chunk, raw) = tokio::task::spawn_blocking(move || {
+                let raw =
+                    codec::decompress(chunk.codec, &encoded, chunk.uncompressed_len as usize)?;
+                if codec::hash(&raw) != chunk.hash {
+                    bail!("hash mismatch for chunk");
+                }
+                Ok::<_, anyhow::Error>((chunk, raw))
+            })
+            .await??;
+            Ok(DecodedData::Chunk { header: chunk, raw })
+        }
+    }
 }
 
 fn validate_manifest(entries: &[ManifestEntry]) -> Result<HashMap<u64, ManifestEntry>> {
@@ -975,48 +1204,43 @@ impl ReceiverState {
         self.completed.len() as u64 == self.total_files
     }
 
-    async fn process_stream(&mut self, mut stream: RecvStream) -> Result<()> {
-        let header: DataHeader = cftp_proto::read_frame(&mut stream)
-            .await
-            .context("failed to read data header")?;
-        match header {
-            DataHeader::Pack(pack) => self.process_pack(pack, &mut stream).await,
-            DataHeader::Chunk(chunk) => self.process_chunk(chunk, &mut stream).await,
+    fn apply(&mut self, data: DecodedData) -> Result<()> {
+        match data {
+            DecodedData::Pack {
+                header,
+                raw,
+                entries,
+            } => self.apply_pack(header, raw, entries),
+            DecodedData::Chunk { header, raw } => self.apply_chunk(header, raw),
         }
     }
 
-    async fn process_pack(&mut self, pack: PackHeader, stream: &mut RecvStream) -> Result<()> {
-        if pack.compressed_len as usize > cftp_proto::MAX_DATA_PAYLOAD {
-            bail!("pack payload too large");
-        }
-        if pack.uncompressed_len as usize > cftp_proto::MAX_DATA_PAYLOAD {
-            bail!("pack expands beyond the maximum payload size");
-        }
-        let mut encoded = vec![0u8; pack.compressed_len as usize];
-        stream.read_exact(&mut encoded).await?;
+    fn apply_pack(
+        &mut self,
+        pack: PackHeader,
+        raw: Vec<u8>,
+        entries: Vec<(u64, Range<usize>)>,
+    ) -> Result<()> {
         self.wire_received = self.wire_received.saturating_add(pack.compressed_len);
-        let raw = codec::decompress(pack.codec, &encoded, pack.uncompressed_len as usize)?;
 
-        let mut offset = 0usize;
-        for pack_entry in &pack.entries {
-            let (file_id, file_size, file_mode, file_mtime, entry_path, relative) = {
+        for (file_id, range) in entries {
+            let (file_size, file_mode, file_mtime, entry_path, relative) = {
                 let entry = self
                     .entries
-                    .get(&pack_entry.file_id)
-                    .with_context(|| format!("unknown file id {}", pack_entry.file_id))?;
+                    .get(&file_id)
+                    .with_context(|| format!("unknown file id {file_id}"))?;
                 if entry.kind != EntryKind::File {
                     bail!("pack entry {} is not a file", entry.path);
                 }
-                if self.completed.contains(&entry.id) {
+                if self.completed.contains(&file_id) {
                     bail!("received duplicate data for {}", entry.path);
                 }
                 let relative = self
                     .rel_paths
-                    .get(&entry.id)
+                    .get(&file_id)
                     .with_context(|| format!("missing path for {}", entry.path))?
                     .clone();
                 (
-                    entry.id,
                     entry.size,
                     entry.mode,
                     entry.mtime,
@@ -1024,33 +1248,25 @@ impl ReceiverState {
                     relative,
                 )
             };
-            let size = pack_entry.size as usize;
-            let end = offset.checked_add(size).context("pack size overflow")?;
-            if end > raw.len() {
-                bail!("pack entry {entry_path} exceeds the payload");
-            }
-            let contents = &raw[offset..end];
-            if codec::hash(contents) != pack_entry.hash {
-                bail!("hash mismatch for {entry_path}");
+
+            let contents = raw
+                .get(range.clone())
+                .with_context(|| format!("pack entry {entry_path} exceeds the payload"))?;
+            if contents.len() as u64 != file_size {
+                bail!("pack entry {entry_path} has the wrong size");
             }
             path::write_atomic(&self.root, &relative, contents, file_mode, file_mtime)?;
             self.written_bytes = self.written_bytes.saturating_add(file_size);
             self.complete_file(file_id, file_size)?;
-            offset = end;
-        }
-        if offset != raw.len() {
-            bail!("pack payload contains trailing bytes");
         }
         Ok(())
     }
 
-    async fn process_chunk(&mut self, chunk: ChunkHeader, stream: &mut RecvStream) -> Result<()> {
-        if chunk.compressed_len as usize > cftp_proto::MAX_DATA_PAYLOAD {
-            bail!("chunk payload too large");
-        }
-        if chunk.uncompressed_len as usize > cftp_proto::MAX_DATA_PAYLOAD {
-            bail!("chunk expands beyond the maximum payload size");
-        }
+    fn apply_chunk(&mut self, chunk: ChunkHeader, raw: Vec<u8>) -> Result<()> {
+        self.wire_received = self
+            .wire_received
+            .saturating_add(chunk.compressed_len as u64);
+
         let entry = self
             .entries
             .get(&chunk.file_id)
@@ -1065,15 +1281,8 @@ impl ReceiverState {
         if chunk.offset.saturating_add(chunk.uncompressed_len as u64) > entry.size {
             bail!("chunk for {} exceeds file size", entry.path);
         }
-
-        let mut encoded = vec![0u8; chunk.compressed_len as usize];
-        stream.read_exact(&mut encoded).await?;
-        self.wire_received = self
-            .wire_received
-            .saturating_add(chunk.compressed_len as u64);
-        let raw = codec::decompress(chunk.codec, &encoded, chunk.uncompressed_len as usize)?;
-        if codec::hash(&raw) != chunk.hash {
-            bail!("hash mismatch for {}", entry.path);
+        if raw.len() != chunk.uncompressed_len as usize {
+            bail!("chunk for {} has the wrong size", entry.path);
         }
 
         if !self.pending.contains_key(&entry.id) {

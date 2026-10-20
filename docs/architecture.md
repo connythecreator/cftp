@@ -37,6 +37,17 @@ cftp is split into three crates:
 - Known incompressible extensions are sent raw.
 - Every pack entry and chunk carries a BLAKE3 hash.
 
+## Parallelism
+
+- Source scanning is sequential.
+- Pack building and chunk compression run in a bounded pool sized from
+  `available_parallelism()`.
+- Up to 32 data streams are sent concurrently.
+- The server decodes up to 32 streams concurrently and serializes state changes
+  and disk writes behind a mutex.
+- Throughput can still be limited by the network, disk, or QUIC flow control
+  rather than CPU count.
+
 ## Throughput metrics
 
 The client progress bar can show four rates:
