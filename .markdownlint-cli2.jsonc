@@ -1,0 +1,12 @@
+{
+  "ignores": [
+    "target/**",
+    "packaging/generated/**",
+    "packaging/arch/src/**",
+    "AGENTS.md"
+  ],
+  "config": {
+    "MD013": false,
+    "MD024": { "siblings_only": true }
+  }
+}

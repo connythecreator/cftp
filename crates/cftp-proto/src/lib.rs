@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Wire protocol for cftp.
 
 use serde::{Deserialize, Serialize};

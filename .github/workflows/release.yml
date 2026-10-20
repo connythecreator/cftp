@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check tag and package versions
+        run: |
+          version=$(cargo pkgid -p cftp-cli | sed 's/.*[#@]//')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match v$version" >&2
+            exit 1
+          fi
+          grep -qx "pkgver=$version" packaging/arch/PKGBUILD
+      - name: Check Arch metadata
+        run: |
+          make arch-srcinfo
+          git diff --exit-code -- packaging/arch/.SRCINFO
+
+  deb:
+    name: Debian package
+    runs-on: ubuntu-latest
+    needs: verify
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --version 3.8.0 --locked
+      - name: Build Debian package
+        run: make deb
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cftp-deb
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+  arch:
+    name: Arch package
+    runs-on: ubuntu-latest
+    needs: verify
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Arch package
+        run: make arch-docker
+      - name: Stage metadata
+        run: cp packaging/arch/.SRCINFO packaging/arch/cftp.SRCINFO
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cftp-arch
+          path: |
+            packaging/arch/*.pkg.tar.zst
+            packaging/arch/cftp.SRCINFO
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs: [deb, arch]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS
+      - uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.deb
+            dist/*.pkg.tar.zst
+            dist/cftp.SRCINFO
+            dist/SHA256SUMS

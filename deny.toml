@@ -1,0 +1,49 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+unmaintained = "workspace"
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "GPL-3.0-only",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[[licenses.exceptions]]
+name = "filetime"
+allow = ["MIT", "Apache-2.0"]
+
+[[licenses.exceptions]]
+name = "same-file"
+allow = ["Unlicense", "MIT"]
+
+[[licenses.exceptions]]
+name = "version_check"
+allow = ["MIT", "Apache-2.0"]
+
+[[licenses.exceptions]]
+name = "walkdir"
+allow = ["Unlicense", "MIT"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

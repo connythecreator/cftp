@@ -1,0 +1,14 @@
+[files]
+extend-exclude = ["target", "packaging/generated", "packaging/arch/src", "Cargo.lock", "AGENTS.md"]
+
+[default.extend-words]
+cftp = "cftp"
+zstd = "zstd"
+rcgen = "rcgen"
+webpki = "webpki"
+blake3 = "blake3"
+mangen = "mangen"
+quinn = "quinn"
+postcard = "postcard"
+rustls = "rustls"
+Connys = "Connys"

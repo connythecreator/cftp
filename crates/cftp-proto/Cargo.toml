@@ -3,6 +3,7 @@ name = "cftp-proto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]

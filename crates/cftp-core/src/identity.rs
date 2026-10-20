@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,8 +9,9 @@ use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
 
 pub const DEFAULT_SERVER_NAME: &str = "cftp.local";
@@ -193,10 +193,8 @@ pub fn init_identity(paths: &IdentityPaths, force: bool) -> Result<IdentityInfo>
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let file = fs::File::open(path)
-        .with_context(|| format!("failed to open certificate {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_file_iter(path)
+        .with_context(|| format!("failed to open certificate {}", path.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .with_context(|| format!("failed to parse certificate {}", path.display()))?;
     if certs.is_empty() {
@@ -211,12 +209,8 @@ fn load_first_cert(path: &Path) -> Result<CertificateDer<'static>> {
 }
 
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let file = fs::File::open(path)
-        .with_context(|| format!("failed to open private key {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
-        .with_context(|| format!("failed to parse private key {}", path.display()))?
-        .with_context(|| format!("no private key found in {}", path.display()))
+    PrivateKeyDer::from_pem_file(path)
+        .with_context(|| format!("failed to parse private key {}", path.display()))
 }
 
 pub fn fingerprint(der: &[u8]) -> String {

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Transfer engine and transport for cftp.
 
 pub mod codec;

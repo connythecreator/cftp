@@ -3,6 +3,7 @@ name = "cftp-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
@@ -17,7 +18,7 @@ postcard.workspace = true
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rcgen.workspace = true
 rustls.workspace = true
-rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
