@@ -1,0 +1,45 @@
+[package]
+name = "cftp-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "cftp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+cftp-core = { path = "../cftp-core" }
+clap.workspace = true
+indicatif.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+clap_complete.workspace = true
+clap_mangen.workspace = true
+
+[package.metadata.deb]
+name = "cftp"
+maintainer = "Conleth <103609099@student.swin.edu.au>"
+copyright = "2026, Conleth"
+license-file = ["../../LICENSE", "0"]
+extended-description = "cftp transfers files and directory trees over QUIC with mutual TLS, zstd compression, and batched or chunked payloads."
+section = "utils"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/cftp", "usr/bin/", "755"],
+    ["../../packaging/generated/cftp.1", "usr/share/man/man1/", "644"],
+    ["../../packaging/generated/cftp.bash", "usr/share/bash-completion/completions/cftp", "644"],
+    ["../../packaging/generated/_cftp", "usr/share/zsh/vendor-completions/_cftp", "644"],
+    ["../../packaging/generated/cftp.fish", "usr/share/fish/vendor_completions.d/cftp.fish", "644"],
+]

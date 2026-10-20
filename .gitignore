@@ -1,0 +1,8 @@
+# Build output
+/target/
+/packaging/generated/
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/*.tar.gz
+/packaging/arch/*.pkg.tar.*
+*.deb

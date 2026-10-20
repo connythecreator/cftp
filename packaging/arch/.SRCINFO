@@ -1,0 +1,16 @@
+pkgbase = cftp
+	pkgdesc = QUIC-based file transfer with zstd compression and mutual TLS
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/connythecreator/cftp
+	arch = x86_64
+	license = GPL-3.0-only
+	makedepends = cargo
+	makedepends = rust
+	depends = glibc
+	depends = gcc-libs
+	options = !lto
+	source = cftp-0.1.0.tar.gz::https://github.com/connythecreator/cftp/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = cftp
