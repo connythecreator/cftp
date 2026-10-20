@@ -11,7 +11,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
-- QUIC transport with mutual TLS and ALPN `cftp/1`.
+- QUIC transport with mutual TLS and ALPN `cftp/2`.
 - Push transfers for files and directory trees.
 - Small-file packing and offset-based chunking for large files.
 - zstd compression with incompressible-extension detection.
@@ -20,9 +20,21 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Symlink transfers on Unix with escape protection.
 - Path traversal and symlink-escape rejection.
 - Local directory copy mode.
-- Progress bars and quiet mode.
+- Progress bars with local read/send and remote receive/write throughput.
 - Identity generation with `cftp identity init`.
 - Debian and Arch packaging, man pages, and shell completions.
+- CLI integration tests for identity setup, local copy, and loopback transfers.
+
+### Changed
+
+- Protocol version and ALPN bumped to `2` for server progress telemetry.
+
+### Fixed
+
+- Chunk receiving now rejects overlapping ranges and files with gaps.
+- Local copy resolves destination paths before the source/destination overlap check.
+- The server reports validation errors before closing the connection.
+- The README quick start no longer creates a doubled destination directory.
 
 ### Security
 

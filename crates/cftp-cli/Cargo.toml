@@ -25,8 +25,11 @@ tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+assert_cmd = "2"
 clap_complete.workspace = true
 clap_mangen.workspace = true
+predicates = "3"
+tempfile = "3"
 
 [package.metadata.deb]
 name = "cftp"

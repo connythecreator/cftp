@@ -1,11 +1,13 @@
 SHELL := /bin/bash
 
 VERSION := $(shell cargo pkgid -p cftp-cli | sed 's/.*[#@]//')
+HOST_UID := $(shell id -u)
+HOST_GID := $(shell id -g)
 ARCH_DIR := packaging/arch
 ARCH_TARBALL := $(ARCH_DIR)/cftp-$(VERSION).tar.gz
 DEB := target/debian/cftp_$(VERSION)-1_amd64.deb
 
-.PHONY: all assets release fmt fmt-check clippy test doc check lint deny typos markdownlint actionlint ci check-version deb arch-tarball arch-docker arch-srcinfo verify-deb clean
+.PHONY: all assets release fmt fmt-check clippy test doc check lint deny typos markdownlint actionlint ci check-version deb arch-tarball arch-docker arch-chown arch-srcinfo verify-deb clean
 
 all: deb
 
@@ -67,6 +69,10 @@ arch-docker: arch-tarball
 		useradd -m builder && \
 		chown -R builder /pkg && \
 		su builder -c "makepkg -f --noconfirm"'
+	$(MAKE) arch-chown
+
+arch-chown:
+	docker run --rm -v "$(CURDIR)/$(ARCH_DIR):/pkg" archlinux:base-devel chown -R $(HOST_UID):$(HOST_GID) /pkg
 
 arch-srcinfo:
 	docker run --rm -v "$(CURDIR)/$(ARCH_DIR):/pkg" -w /pkg archlinux:base-devel bash -lc '\
@@ -74,6 +80,7 @@ arch-srcinfo:
 		useradd -m builder && \
 		chown -R builder /pkg && \
 		su builder -c "makepkg --printsrcinfo"' > $(ARCH_DIR)/.SRCINFO
+	$(MAKE) arch-chown
 
 verify-deb: deb
 	dpkg-deb --info "$(DEB)"

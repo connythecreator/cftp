@@ -13,7 +13,7 @@ are split into chunks.
 
 ## Features
 
-- QUIC transport with mutual TLS and ALPN `cftp/1`.
+- QUIC transport with mutual TLS and ALPN `cftp/2`.
 - zstd compression, skipping known incompressible file extensions.
 - Small-file packs and offset-based chunks for large files.
 - BLAKE3 integrity checks for every pack entry and chunk.
@@ -21,7 +21,16 @@ are split into chunks.
 - Symlink support on Unix, with escape protection.
 - Path traversal and symlink-escape rejection.
 - Local directory copy when the destination is not a `cftp://` URL.
+- Live read, sent, received, and written throughput in the progress bar.
 - Progress bars, with `--quiet` to disable them.
+
+## Documentation
+
+- [Architecture and protocol](docs/architecture.md)
+- [Packaging and releases](docs/packaging.md)
+- [Contributing](.github/CONTRIBUTING.md)
+- [Security policy](.github/SECURITY.md)
+- [Changelog](CHANGELOG.md)
 
 ## Requirements
 
@@ -85,7 +94,7 @@ cftp serve --root ./incoming
 On the sender:
 
 ```bash
-cftp put ./project cftp://receiver:4433/project
+cftp put ./project/ cftp://receiver:4433/project
 ```
 
 The receiver writes the transfer under `./incoming/project/`. `serve` is
@@ -156,36 +165,26 @@ On Linux the default directory is `~/.config/cftp`.
 The default port for a remote destination is `4433`. Only the `cftp://` scheme
 is accepted; any other `://` destination is rejected.
 
-## How it works
+## Throughput
 
-- The client opens one bidirectional control stream and sends a manifest of
-  relative paths, sizes, modes, mtimes, and symlink targets.
-- Control messages use a 4-byte big-endian length followed by a postcard payload.
-- Data travels on many unidirectional streams. Each stream starts with a
-  `DataHeader` frame, followed by raw payload bytes.
-- Files at or below the small-file threshold are packed together. Larger files
-  are sent as chunks with explicit offsets.
-- Packs use zstd level 3 and chunks use zstd level 1. Known incompressible
-  extensions are sent raw.
-- Every pack entry and chunk carries a BLAKE3 hash.
-- `MAX_CONTROL_FRAME` is 256 MiB and `MAX_DATA_PAYLOAD` is 64 MiB.
+The client progress bar shows four rates:
+
+- `read`: source bytes read by the client.
+- `sent`: payload bytes sent by the client.
+- `recv`: payload bytes received by the server.
+- `write`: logical bytes written to disk by the server.
+
+Rates are displayed in bits per second (`Gbps`, `Mbps`, `Kbps`, or `bps`) and
+are application-level estimates over a short window, not operating system
+interface counters. Compression means `read`/`write` can differ substantially
+from `sent`/`recv`.
 
 ## Security
 
-- Transfers require mutual TLS. Each peer verifies the other against the
-  configured CA.
-- Received paths are normalized and rejected if they are absolute, contain
-  `..`, or escape the destination through a symlink.
-- Files are written to temporary files and renamed into place only after they
-  are complete.
-- QUIC protects data in transit. cftp does not add application-layer encryption
-  beyond TLS.
-- Restrict the UDP port to peers you trust. The default identity layout uses the
-  same private key for client and server authentication, so protect
-  `identity.key`.
-
-To report a vulnerability, see [SECURITY.md](SECURITY.md). Do not open a public
-issue for security problems.
+Transfers require mutual TLS, received paths are confined to the destination
+root, and files are written atomically. See
+[architecture and protocol](docs/architecture.md) for the full security model and
+[the security policy](.github/SECURITY.md) for reporting vulnerabilities.
 
 ## Development
 
@@ -195,36 +194,13 @@ cargo test --workspace --locked
 make check
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for coding standards, protocol rules, and
-the pull request checklist.
+See [CONTRIBUTING.md](.github/CONTRIBUTING.md) for coding standards, protocol
+rules, and the pull request checklist.
 
 ## Packaging
 
-Debian builds require `cargo-deb`:
-
-```bash
-cargo install cargo-deb --version 3.8.0 --locked
-make deb
-make verify-deb
-```
-
-Arch builds require Docker when `makepkg` is not available:
-
-```bash
-make arch-docker
-make arch-srcinfo
-```
-
-`make arch-tarball` creates a `git archive` tarball for `makepkg`. It only sees
-committed files, so commit packaging changes before building.
-
-To publish a release:
-
-1. Update the workspace version, `PKGBUILD` `pkgver`/`pkgrel`, and `CHANGELOG.md`.
-2. Run `make arch-srcinfo` and commit the updated `.SRCINFO`.
-3. Tag the release as `vX.Y.Z` and push the tag.
-4. The release workflow builds the `.deb` and Arch package and attaches them to
-   the GitHub Release.
+See [packaging and releases](docs/packaging.md) for Debian, Arch, and release
+workflows.
 
 ## License
 

@@ -6,11 +6,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(
-    name = "cftp",
-    version,
-    about = "Fast, resumable file transfers over QUIC"
-)]
+#[command(name = "cftp", version, about = "Fast file transfers over QUIC")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

@@ -3,13 +3,13 @@ use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use cftp_proto::{
     Abort, ChunkHeader, ClientHello, ClientMessage, Codec, Complete, DataHeader, Done, EntryKind,
     ManifestEntry, PROTOCOL_VERSION, PackEntry, PackHeader, ServerHello, ServerMessage,
-    TransferMode,
+    ServerProgress, TransferMode,
 };
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::io::AsyncReadExt;
@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use crate::codec::{self, CHUNK_LEVEL, PACK_LEVEL};
 use crate::identity::{DEFAULT_SERVER_NAME, Identity};
 use crate::path;
-use crate::progress::{ProgressEvent, ProgressSender};
+use crate::progress::{ProgressEvent, ProgressSender, TransferProgress};
 use crate::scan;
 
 #[derive(Debug, Clone)]
@@ -120,30 +120,58 @@ pub async fn push(
             }
         }
         ServerMessage::Error(err) => bail!("server error: {}", err.message),
+        ServerMessage::Progress(_) => bail!("server sent progress before accepting the transfer"),
         ServerMessage::Done(_) => bail!("server completed before receiving data"),
     }
+
+    let (server_tx, mut server_rx) = mpsc::unbounded_channel::<Result<ServerMessage, _>>();
+    let control_task = tokio::spawn(async move {
+        loop {
+            match cftp_proto::read_frame::<_, ServerMessage>(&mut control_recv).await {
+                Ok(message) => {
+                    if server_tx.send(Ok(message)).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = server_tx.send(Err(err));
+                    break;
+                }
+            }
+        }
+    });
 
     let totals = Totals {
         files: scan.total_files,
         bytes: scan.total_bytes,
     };
     let mut stats = PushStats::default();
-    let mut bytes_done = 0u64;
-    let mut files_done = 0u64;
+    let mut state = SendState::default();
 
     let (tx, mut rx) = mpsc::channel::<Result<EncodedItem>>(8);
     let producer = tokio::spawn(produce_items(scan.clone(), opts.clone(), tx));
-    while let Some(item) = rx.recv().await {
-        send_item(
-            &connection,
-            item?,
-            &opts,
-            totals,
-            &mut stats,
-            &mut files_done,
-            &mut bytes_done,
-        )
-        .await?;
+    loop {
+        tokio::select! {
+            biased;
+            message = server_rx.recv() => {
+                match message {
+                    Some(Ok(message)) => {
+                        if apply_server_message(message, &mut state, &opts, totals)?.is_some() {
+                            bail!("server completed before receiving data");
+                        }
+                    }
+                    Some(Err(err)) => return Err(err).context("control stream failed"),
+                    None => bail!("server closed control stream before completion"),
+                }
+            }
+            item = rx.recv() => {
+                let Some(item) = item else {
+                    break;
+                };
+                send_item(&connection, item?, &opts, totals, &mut stats, &mut state).await?;
+                drain_server_messages(&mut server_rx, &mut state, &opts, totals)?;
+            }
+        }
     }
     producer.await.context("producer task panicked")?;
 
@@ -156,15 +184,21 @@ pub async fn push(
     )
     .await?;
 
-    let response: ServerMessage = cftp_proto::read_frame(&mut control_recv).await?;
-    match response {
-        ServerMessage::Done(done) => {
-            stats.files = done.files;
-            stats.bytes = done.bytes;
+    let done = loop {
+        match server_rx.recv().await {
+            Some(Ok(message)) => {
+                if let Some(done) = apply_server_message(message, &mut state, &opts, totals)? {
+                    break done;
+                }
+            }
+            Some(Err(err)) => return Err(err).context("control stream failed"),
+            None => bail!("server closed control stream before completion"),
         }
-        ServerMessage::Error(err) => bail!("server error: {}", err.message),
-        ServerMessage::Hello(_) => bail!("unexpected server hello"),
-    }
+    };
+    control_task.abort();
+
+    stats.files = done.files;
+    stats.bytes = done.bytes;
 
     if let Some(progress) = &opts.progress {
         let _ = progress.send(ProgressEvent::Complete {
@@ -175,6 +209,56 @@ pub async fn push(
 
     control_send.finish()?;
     Ok(stats)
+}
+
+#[derive(Debug, Default)]
+struct SendState {
+    read_bytes: u64,
+    sent_bytes: u64,
+    bytes_done: u64,
+    files_done: u64,
+    remote_received: u64,
+    remote_written: u64,
+    remote_elapsed_millis: u64,
+}
+
+fn apply_server_message(
+    message: ServerMessage,
+    state: &mut SendState,
+    opts: &PushOptions,
+    totals: Totals,
+) -> Result<Option<Done>> {
+    match message {
+        ServerMessage::Progress(progress) => {
+            state.remote_received = progress.received_bytes;
+            state.remote_written = progress.written_bytes;
+            state.remote_elapsed_millis = progress.elapsed_millis;
+            publish_push_progress(opts, state, totals);
+            Ok(None)
+        }
+        ServerMessage::Done(done) => Ok(Some(done)),
+        ServerMessage::Error(err) => bail!("server error: {}", err.message),
+        ServerMessage::Hello(_) => bail!("unexpected server hello"),
+    }
+}
+
+fn drain_server_messages(
+    rx: &mut mpsc::UnboundedReceiver<Result<ServerMessage, cftp_proto::ProtoError>>,
+    state: &mut SendState,
+    opts: &PushOptions,
+    totals: Totals,
+) -> Result<()> {
+    while let Ok(message) = rx.try_recv() {
+        match message {
+            Ok(message) => {
+                if apply_server_message(message, state, opts, totals)?.is_some() {
+                    bail!("server completed before receiving data");
+                }
+            }
+            Err(err) => return Err(err).context("control stream failed"),
+        }
+    }
+    Ok(())
 }
 
 struct BuiltPack {
@@ -378,8 +462,7 @@ async fn send_item(
     opts: &PushOptions,
     totals: Totals,
     stats: &mut PushStats,
-    files_done: &mut u64,
-    bytes_done: &mut u64,
+    state: &mut SendState,
 ) -> Result<()> {
     match item {
         EncodedItem::Pack {
@@ -388,6 +471,7 @@ async fn send_item(
             logical_bytes,
             files,
         } => {
+            let wire_bytes = payload.len() as u64;
             let mut stream = connection.open_uni().await?;
             cftp_proto::write_frame(&mut stream, &DataHeader::Pack(header)).await?;
             stream.write_all(&payload).await?;
@@ -396,8 +480,10 @@ async fn send_item(
             stats.files += files;
             stats.bytes += logical_bytes;
             stats.packs += 1;
-            *files_done += files;
-            *bytes_done += logical_bytes;
+            state.read_bytes = state.read_bytes.saturating_add(logical_bytes);
+            state.sent_bytes = state.sent_bytes.saturating_add(wire_bytes);
+            state.bytes_done = state.bytes_done.saturating_add(logical_bytes);
+            state.files_done = state.files_done.saturating_add(files);
         }
         EncodedItem::Chunk {
             header,
@@ -405,6 +491,7 @@ async fn send_item(
             logical_bytes,
             file_done,
         } => {
+            let wire_bytes = payload.len() as u64;
             let mut stream = connection.open_uni().await?;
             cftp_proto::write_frame(&mut stream, &DataHeader::Chunk(header)).await?;
             stream.write_all(&payload).await?;
@@ -412,14 +499,16 @@ async fn send_item(
 
             stats.bytes += logical_bytes;
             stats.chunks += 1;
-            *bytes_done += logical_bytes;
+            state.read_bytes = state.read_bytes.saturating_add(logical_bytes);
+            state.sent_bytes = state.sent_bytes.saturating_add(wire_bytes);
+            state.bytes_done = state.bytes_done.saturating_add(logical_bytes);
             if file_done {
                 stats.files += 1;
-                *files_done += 1;
+                state.files_done = state.files_done.saturating_add(1);
             }
         }
     }
-    publish_progress(opts, *bytes_done, *files_done, totals);
+    publish_push_progress(opts, state, totals);
     Ok(())
 }
 
@@ -429,14 +518,20 @@ struct Totals {
     bytes: u64,
 }
 
-fn publish_progress(opts: &PushOptions, bytes_done: u64, files_done: u64, totals: Totals) {
+fn publish_push_progress(opts: &PushOptions, state: &SendState, totals: Totals) {
     if let Some(progress) = &opts.progress {
-        let _ = progress.send(ProgressEvent::Sending {
-            bytes_done,
+        let _ = progress.send(ProgressEvent::Sending(TransferProgress {
+            at: Instant::now(),
+            bytes_done: state.bytes_done,
             bytes_total: totals.bytes,
-            files_done,
+            files_done: state.files_done,
             files_total: totals.files,
-        });
+            read_bytes: state.read_bytes,
+            sent_bytes: state.sent_bytes,
+            received_bytes: state.remote_received,
+            written_bytes: state.remote_written,
+            remote_elapsed_millis: state.remote_elapsed_millis,
+        }));
     }
 }
 
@@ -491,6 +586,7 @@ pub async fn serve_once(identity: &Identity, opts: ServeOptions) -> Result<Serve
         .await
         .context("client did not open a control stream")?;
 
+    let connection_for_error = connection.clone();
     let result = receive_connection(
         connection,
         control_send,
@@ -500,6 +596,10 @@ pub async fn serve_once(identity: &Identity, opts: ServeOptions) -> Result<Serve
         peer,
     )
     .await;
+
+    if result.is_err() {
+        let _ = tokio::time::timeout(Duration::from_secs(1), connection_for_error.closed()).await;
+    }
 
     endpoint.wait_idle().await;
     endpoint.close(0u32.into(), b"done");
@@ -538,22 +638,40 @@ async fn receive_connection(
             }),
         )
         .await;
+        let _ = control_send.finish();
         bail!("{message}");
     }
 
     if hello.mode != TransferMode::Push {
-        bail!("unsupported transfer mode");
+        let err = anyhow::anyhow!("unsupported transfer mode");
+        send_server_error(&mut control_send, &err).await;
+        return Err(err);
     }
 
-    let destination = path::validate_destination(&hello.destination)?;
-    if !destination.as_os_str().is_empty() {
-        path::create_directory(&root, &destination, 0o755, 0)?;
-    }
+    let destination = match path::validate_destination(&hello.destination) {
+        Ok(destination) => destination,
+        Err(err) => {
+            send_server_error(&mut control_send, &err).await;
+            return Err(err);
+        }
+    };
 
-    let entries = validate_manifest(&hello.entries)?;
+    let entries = match validate_manifest(&hello.entries) {
+        Ok(entries) => entries,
+        Err(err) => {
+            send_server_error(&mut control_send, &err).await;
+            return Err(err);
+        }
+    };
     let mut rel_paths = HashMap::new();
     for entry in entries.values() {
-        let relative = path::validate_relative(&entry.path)?;
+        let relative = match path::validate_relative(&entry.path) {
+            Ok(relative) => relative,
+            Err(err) => {
+                send_server_error(&mut control_send, &err).await;
+                return Err(err);
+            }
+        };
         rel_paths.insert(entry.id, destination.join(relative));
     }
 
@@ -567,23 +685,9 @@ async fn receive_connection(
         .map(|entry| entry.size)
         .sum();
 
-    for entry in entries.values() {
-        let Some(relative) = rel_paths.get(&entry.id) else {
-            continue;
-        };
-        match entry.kind {
-            EntryKind::Directory => {
-                path::create_directory(&root, relative, entry.mode, entry.mtime)?;
-            }
-            EntryKind::Symlink => {
-                let target = entry
-                    .link_target
-                    .as_deref()
-                    .with_context(|| format!("symlink {} has no target", entry.path))?;
-                path::create_symlink(&root, relative, target)?;
-            }
-            EntryKind::File => {}
-        }
+    if let Err(err) = create_manifest_entries(&root, &destination, &entries, &rel_paths) {
+        send_server_error(&mut control_send, &err).await;
+        return Err(err);
     }
 
     cftp_proto::write_frame(
@@ -600,15 +704,19 @@ async fn receive_connection(
         root,
         entries,
         rel_paths,
-        received: HashMap::new(),
+        ranges: HashMap::new(),
         completed: HashSet::new(),
         pending: HashMap::new(),
         total_files,
         total_bytes,
         files_done: 0,
         bytes_done: 0,
+        wire_received: 0,
+        written_bytes: 0,
+        started: Instant::now(),
         progress,
     };
+    let mut last_progress = Instant::now();
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let control_task = tokio::spawn(async move {
@@ -630,6 +738,11 @@ async fn receive_connection(
             match tokio::time::timeout(Duration::from_secs(30), connection.accept_uni()).await {
                 Ok(Ok(stream)) => {
                     if let Err(err) = state.process_stream(stream).await {
+                        break Err(err);
+                    }
+                    if let Err(err) =
+                        maybe_send_progress(&mut control_send, &state, &mut last_progress).await
+                    {
                         break Err(err);
                     }
                 }
@@ -666,6 +779,11 @@ async fn receive_connection(
                         if let Err(err) = state.process_stream(stream).await {
                             break Err(err);
                         }
+                        if let Err(err) =
+                            maybe_send_progress(&mut control_send, &state, &mut last_progress).await
+                        {
+                            break Err(err);
+                        }
                     }
                     Err(err) => {
                         break Err(err).context("failed to accept data stream");
@@ -677,10 +795,7 @@ async fn receive_connection(
     control_task.abort();
 
     if let Err(err) = result {
-        let message = err.to_string();
-        let _ =
-            cftp_proto::write_frame(&mut control_send, &ServerMessage::Error(Abort { message }))
-                .await;
+        send_server_error(&mut control_send, &err).await;
         return Err(err);
     }
 
@@ -688,6 +803,11 @@ async fn receive_connection(
         files: state.files_done,
         bytes: state.bytes_done,
     };
+    cftp_proto::write_frame(
+        &mut control_send,
+        &ServerMessage::Progress(state.server_progress()),
+    )
+    .await?;
     cftp_proto::write_frame(&mut control_send, &ServerMessage::Done(done.clone())).await?;
     control_send.finish()?;
     // Keep the connection alive long enough for the client to read the final
@@ -705,6 +825,65 @@ async fn receive_connection(
         bytes: done.bytes,
         peer: Some(peer),
     })
+}
+
+async fn send_server_error(control_send: &mut SendStream, err: &anyhow::Error) {
+    let _ = cftp_proto::write_frame(
+        control_send,
+        &ServerMessage::Error(Abort {
+            message: err.to_string(),
+        }),
+    )
+    .await;
+    let _ = control_send.finish();
+}
+
+fn create_manifest_entries(
+    root: &Path,
+    destination: &Path,
+    entries: &HashMap<u64, ManifestEntry>,
+    rel_paths: &HashMap<u64, PathBuf>,
+) -> Result<()> {
+    if !destination.as_os_str().is_empty() {
+        path::create_directory(root, destination, 0o755, 0)?;
+    }
+
+    for entry in entries.values() {
+        let Some(relative) = rel_paths.get(&entry.id) else {
+            continue;
+        };
+        match entry.kind {
+            EntryKind::Directory => {
+                path::create_directory(root, relative, entry.mode, entry.mtime)?;
+            }
+            EntryKind::Symlink => {
+                let target = entry
+                    .link_target
+                    .as_deref()
+                    .with_context(|| format!("symlink {} has no target", entry.path))?;
+                path::create_symlink(root, relative, target)?;
+            }
+            EntryKind::File => {}
+        }
+    }
+    Ok(())
+}
+
+async fn maybe_send_progress(
+    control_send: &mut SendStream,
+    state: &ReceiverState,
+    last: &mut Instant,
+) -> Result<()> {
+    if last.elapsed() < Duration::from_millis(250) {
+        return Ok(());
+    }
+    *last = Instant::now();
+    cftp_proto::write_frame(
+        control_send,
+        &ServerMessage::Progress(state.server_progress()),
+    )
+    .await?;
+    Ok(())
 }
 
 fn validate_manifest(entries: &[ManifestEntry]) -> Result<HashMap<u64, ManifestEntry>> {
@@ -736,17 +915,58 @@ struct PendingFile {
     entry: ManifestEntry,
 }
 
+#[derive(Debug, Default)]
+struct ReceivedRanges {
+    ranges: Vec<(u64, u64)>,
+}
+
+impl ReceivedRanges {
+    fn insert(&mut self, start: u64, len: u64) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = start.checked_add(len).context("chunk range overflow")?;
+        for &(existing_start, existing_end) in &self.ranges {
+            if start < existing_end && end > existing_start {
+                bail!("overlapping chunk at offset {start}");
+            }
+        }
+        self.ranges.push((start, end));
+        self.ranges.sort_unstable();
+
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.ranges.len());
+        for &(start, end) in &self.ranges {
+            if let Some(last) = merged.last_mut()
+                && start == last.1
+            {
+                last.1 = end;
+                continue;
+            }
+            merged.push((start, end));
+        }
+        self.ranges = merged;
+        Ok(())
+    }
+
+    fn covers(&self, size: u64) -> bool {
+        size == 0 || self.ranges.as_slice() == [(0, size)]
+    }
+}
+
 struct ReceiverState {
     root: PathBuf,
     entries: HashMap<u64, ManifestEntry>,
     rel_paths: HashMap<u64, PathBuf>,
-    received: HashMap<u64, u64>,
+    ranges: HashMap<u64, ReceivedRanges>,
     completed: HashSet<u64>,
     pending: HashMap<u64, PendingFile>,
     total_files: u64,
     total_bytes: u64,
     files_done: u64,
     bytes_done: u64,
+    wire_received: u64,
+    written_bytes: u64,
+    started: Instant,
     progress: Option<ProgressSender>,
 }
 
@@ -774,32 +994,48 @@ impl ReceiverState {
         }
         let mut encoded = vec![0u8; pack.compressed_len as usize];
         stream.read_exact(&mut encoded).await?;
+        self.wire_received = self.wire_received.saturating_add(pack.compressed_len);
         let raw = codec::decompress(pack.codec, &encoded, pack.uncompressed_len as usize)?;
 
         let mut offset = 0usize;
         for pack_entry in &pack.entries {
-            let entry = self
-                .entries
-                .get(&pack_entry.file_id)
-                .with_context(|| format!("unknown file id {}", pack_entry.file_id))?;
-            if entry.kind != EntryKind::File {
-                bail!("pack entry {} is not a file", entry.path);
-            }
+            let (file_id, file_size, file_mode, file_mtime, entry_path, relative) = {
+                let entry = self
+                    .entries
+                    .get(&pack_entry.file_id)
+                    .with_context(|| format!("unknown file id {}", pack_entry.file_id))?;
+                if entry.kind != EntryKind::File {
+                    bail!("pack entry {} is not a file", entry.path);
+                }
+                if self.completed.contains(&entry.id) {
+                    bail!("received duplicate data for {}", entry.path);
+                }
+                let relative = self
+                    .rel_paths
+                    .get(&entry.id)
+                    .with_context(|| format!("missing path for {}", entry.path))?
+                    .clone();
+                (
+                    entry.id,
+                    entry.size,
+                    entry.mode,
+                    entry.mtime,
+                    entry.path.clone(),
+                    relative,
+                )
+            };
             let size = pack_entry.size as usize;
             let end = offset.checked_add(size).context("pack size overflow")?;
             if end > raw.len() {
-                bail!("pack entry {} exceeds the payload", entry.path);
+                bail!("pack entry {entry_path} exceeds the payload");
             }
             let contents = &raw[offset..end];
             if codec::hash(contents) != pack_entry.hash {
-                bail!("hash mismatch for {}", entry.path);
+                bail!("hash mismatch for {entry_path}");
             }
-            let relative = self
-                .rel_paths
-                .get(&entry.id)
-                .with_context(|| format!("missing path for {}", entry.path))?;
-            path::write_atomic(&self.root, relative, contents, entry.mode, entry.mtime)?;
-            self.complete_file(entry.id, entry.size)?;
+            path::write_atomic(&self.root, &relative, contents, file_mode, file_mtime)?;
+            self.written_bytes = self.written_bytes.saturating_add(file_size);
+            self.complete_file(file_id, file_size)?;
             offset = end;
         }
         if offset != raw.len() {
@@ -823,12 +1059,18 @@ impl ReceiverState {
         if entry.kind != EntryKind::File {
             bail!("chunk entry {} is not a file", entry.path);
         }
+        if self.completed.contains(&entry.id) {
+            bail!("received duplicate chunk for {}", entry.path);
+        }
         if chunk.offset.saturating_add(chunk.uncompressed_len as u64) > entry.size {
             bail!("chunk for {} exceeds file size", entry.path);
         }
 
         let mut encoded = vec![0u8; chunk.compressed_len as usize];
         stream.read_exact(&mut encoded).await?;
+        self.wire_received = self
+            .wire_received
+            .saturating_add(chunk.compressed_len as u64);
         let raw = codec::decompress(chunk.codec, &encoded, chunk.uncompressed_len as usize)?;
         if codec::hash(&raw) != chunk.hash {
             bail!("hash mismatch for {}", entry.path);
@@ -861,15 +1103,15 @@ impl ReceiverState {
             pending.file.seek(SeekFrom::Start(chunk.offset))?;
             pending.file.write_all(&raw)?;
         }
+        self.written_bytes = self.written_bytes.saturating_add(raw.len() as u64);
 
-        let received = self.received.entry(entry.id).or_insert(0);
-        *received = received
-            .checked_add(chunk.uncompressed_len as u64)
-            .context("received byte overflow")?;
-        if *received > entry.size {
-            bail!("received too many bytes for {}", entry.path);
-        }
-        if *received == entry.size {
+        let complete = {
+            let ranges = self.ranges.entry(entry.id).or_default();
+            ranges.insert(chunk.offset, chunk.uncompressed_len as u64)?;
+            ranges.covers(entry.size)
+        };
+        if complete {
+            self.ranges.remove(&entry.id);
             self.finish_pending(entry.id)?;
         } else {
             self.publish_progress();
@@ -878,6 +1120,7 @@ impl ReceiverState {
     }
 
     fn finish_pending(&mut self, file_id: u64) -> Result<()> {
+        self.ranges.remove(&file_id);
         let Some(mut pending) = self.pending.remove(&file_id) else {
             return Ok(());
         };
@@ -901,14 +1144,65 @@ impl ReceiverState {
         Ok(())
     }
 
+    fn transfer_progress(&self) -> TransferProgress {
+        TransferProgress {
+            at: Instant::now(),
+            bytes_done: self.bytes_done,
+            bytes_total: self.total_bytes,
+            files_done: self.files_done,
+            files_total: self.total_files,
+            read_bytes: 0,
+            sent_bytes: 0,
+            received_bytes: self.wire_received,
+            written_bytes: self.written_bytes,
+            remote_elapsed_millis: 0,
+        }
+    }
+
+    fn server_progress(&self) -> ServerProgress {
+        ServerProgress {
+            files_done: self.files_done,
+            files_total: self.total_files,
+            bytes_total: self.total_bytes,
+            received_bytes: self.wire_received,
+            written_bytes: self.written_bytes,
+            elapsed_millis: self.started.elapsed().as_millis() as u64,
+        }
+    }
+
     fn publish_progress(&self) {
         if let Some(progress) = &self.progress {
-            let _ = progress.send(ProgressEvent::Receiving {
-                bytes_done: self.bytes_done,
-                bytes_total: self.total_bytes,
-                files_done: self.files_done,
-                files_total: self.total_files,
-            });
+            let _ = progress.send(ProgressEvent::Receiving(self.transfer_progress()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranges_accept_out_of_order_and_adjacent_chunks() {
+        let mut ranges = ReceivedRanges::default();
+        ranges.insert(10, 5).unwrap();
+        ranges.insert(0, 10).unwrap();
+        assert!(ranges.covers(15));
+    }
+
+    #[test]
+    fn ranges_reject_overlapping_chunks() {
+        let mut ranges = ReceivedRanges::default();
+        ranges.insert(0, 5).unwrap();
+        assert!(ranges.insert(3, 5).is_err());
+    }
+
+    #[test]
+    fn ranges_do_not_cover_gaps() {
+        let mut ranges = ReceivedRanges::default();
+        ranges.insert(0, 5).unwrap();
+        ranges.insert(10, 5).unwrap();
+        assert!(!ranges.covers(15));
+        ranges.insert(5, 5).unwrap();
+        assert!(ranges.covers(15));
     }
 }

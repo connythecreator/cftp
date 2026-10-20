@@ -1,6 +1,8 @@
 use std::fs;
+use std::time::Duration;
 
 use cftp_core::identity::{DEFAULT_SERVER_NAME, Identity, IdentityPaths, init_identity};
+use cftp_core::progress::ProgressEvent;
 use cftp_core::transfer::{PushOptions, ServeOptions, push, serve_once};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -58,12 +60,14 @@ async fn transfers_a_tree_over_mutual_tls() {
     let server = tokio::spawn(async move { serve_once(&server_identity, server_opts).await });
     let addr = ready_rx.await.unwrap();
 
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
     let push_result = push(
         &project,
         addr,
         &client_identity,
         PushOptions {
             server_name: DEFAULT_SERVER_NAME.to_string(),
+            progress: Some(progress_tx),
             ..Default::default()
         },
     )
@@ -74,6 +78,17 @@ async fn transfers_a_tree_over_mutual_tls() {
     }
     let stats = push_result.unwrap();
     server.await.unwrap().unwrap();
+
+    let mut saw_local = false;
+    let mut saw_remote = false;
+    while let Ok(event) = progress_rx.try_recv() {
+        if let ProgressEvent::Sending(stats) = event {
+            saw_local |= stats.read_bytes > 0 && stats.sent_bytes > 0;
+            saw_remote |= stats.received_bytes > 0 && stats.written_bytes > 0;
+        }
+    }
+    assert!(saw_local, "expected local read/send progress");
+    assert!(saw_remote, "expected server receive/write progress");
 
     let expected_bytes = [
         "src/main.js",
@@ -205,4 +220,106 @@ async fn local_copy_rejects_destination_inside_source() {
     let destination = source.join("nested");
     let result = cftp_core::local::copy_local(&source, &destination, None).await;
     assert!(result.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejects_invalid_destination_without_hanging() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity_dir = temp.path().join("identity");
+    let identity_paths = IdentityPaths::in_dir(&identity_dir);
+    init_identity(&identity_paths, false).unwrap();
+
+    let server_identity = Identity::load(
+        &identity_paths.cert,
+        &identity_paths.key,
+        &identity_paths.ca,
+    )
+    .unwrap();
+    let client_identity = Identity::load(
+        &identity_paths.cert,
+        &identity_paths.key,
+        &identity_paths.ca,
+    )
+    .unwrap();
+
+    let source = temp.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("file.txt"), b"hello\n").unwrap();
+    let dest = temp.path().join("dst");
+    fs::create_dir_all(&dest).unwrap();
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_once(
+            &server_identity,
+            ServeOptions {
+                root: dest,
+                listen: "127.0.0.1:0".parse().unwrap(),
+                progress: None,
+                on_ready: Some(ready_tx),
+            },
+        )
+        .await
+    });
+    let addr = ready_rx.await.unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        push(
+            &source,
+            addr,
+            &client_identity,
+            PushOptions {
+                destination: "../escape".to_string(),
+                server_name: DEFAULT_SERVER_NAME.to_string(),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("push timed out waiting for the server error");
+    let err = result.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("escapes"),
+        "unexpected error: {err:#}"
+    );
+
+    let server_result = server.await.unwrap();
+    assert!(server_result.is_err());
+}
+
+#[tokio::test]
+async fn local_copy_rejects_source_inside_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("sample-project");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("file.txt"), b"hello\n").unwrap();
+
+    let result = cftp_core::local::copy_local(&source, temp.path(), None).await;
+    assert!(result.is_err());
+
+    let result = cftp_core::local::copy_local(&source, &source, None).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn local_copy_normalizes_parent_components() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("sample-project");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("file.txt"), b"hello\n").unwrap();
+
+    let inside = source.join("nested/../nested");
+    let result = cftp_core::local::copy_local(&source, &inside, None).await;
+    assert!(result.is_err());
+
+    let destination = temp.path().join("unused/../sample-copy");
+    cftp_core::local::copy_local(&source, &destination, None)
+        .await
+        .unwrap();
+    assert!(
+        temp.path()
+            .join("sample-copy/sample-project/file.txt")
+            .exists()
+    );
 }

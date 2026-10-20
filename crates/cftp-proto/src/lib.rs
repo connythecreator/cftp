@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const ALPN: &[u8] = b"cftp/1";
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const ALPN: &[u8] = b"cftp/2";
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_CONTROL_FRAME: usize = 256 * 1024 * 1024;
 pub const MAX_DATA_PAYLOAD: usize = 64 * 1024 * 1024;
 
@@ -113,6 +113,16 @@ pub struct Done {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerProgress {
+    pub files_done: u64,
+    pub files_total: u64,
+    pub bytes_total: u64,
+    pub received_bytes: u64,
+    pub written_bytes: u64,
+    pub elapsed_millis: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Abort {
     pub message: String,
 }
@@ -129,6 +139,7 @@ pub enum ServerMessage {
     Hello(ServerHello),
     Done(Done),
     Error(Abort),
+    Progress(ServerProgress),
 }
 
 pub async fn write_frame<W, T>(writer: &mut W, value: &T) -> Result<(), ProtoError>
@@ -195,6 +206,29 @@ mod tests {
         let decoded: ClientMessage = decode(&bytes).unwrap();
         match decoded {
             ClientMessage::Hello(hello) => assert_eq!(hello.entries[0].path, "src/main.js"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn server_progress_roundtrip() {
+        let message = ServerMessage::Progress(ServerProgress {
+            files_done: 2,
+            files_total: 3,
+            bytes_total: 100,
+            received_bytes: 50,
+            written_bytes: 40,
+            elapsed_millis: 250,
+        });
+        let bytes = encode(&message).unwrap();
+        let decoded: ServerMessage = decode(&bytes).unwrap();
+        match decoded {
+            ServerMessage::Progress(progress) => {
+                assert_eq!(progress.files_done, 2);
+                assert_eq!(progress.received_bytes, 50);
+                assert_eq!(progress.written_bytes, 40);
+                assert_eq!(progress.elapsed_millis, 250);
+            }
             _ => panic!("wrong variant"),
         }
     }
