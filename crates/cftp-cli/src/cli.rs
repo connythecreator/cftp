@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "cftp", version, about = "Fast file transfers over QUIC")]
@@ -41,11 +41,31 @@ pub struct IdentityInitArgs {
     pub force: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum AuthMode {
+    /// Use certificate mode when certificate flags are supplied, otherwise SSH keys.
+    #[default]
+    Auto,
+    /// Use SSH key authentication.
+    Ssh,
+    /// Use the existing CA and certificate identity.
+    Cert,
+}
+
 #[derive(Args)]
 pub struct ServeArgs {
     /// Directory that received files are written under.
     #[arg(long)]
     pub root: PathBuf,
+    /// Authentication backend.
+    #[arg(long, value_enum, default_value_t = AuthMode::Auto)]
+    pub auth: AuthMode,
+    /// SSH private key used as the server host key.
+    #[arg(long)]
+    pub host_key: Option<PathBuf>,
+    /// SSH authorized_keys file used to verify clients.
+    #[arg(long)]
+    pub authorized_keys: Option<PathBuf>,
     /// UDP address to listen on.
     #[arg(long, default_value = "0.0.0.0:4433")]
     pub listen: SocketAddr,
@@ -78,6 +98,18 @@ pub struct PutArgs {
     /// Without a trailing slash on the source, the source directory name is
     /// preserved under the destination.
     pub dest: String,
+    /// Authentication backend.
+    #[arg(long, value_enum, default_value_t = AuthMode::Auto)]
+    pub auth: AuthMode,
+    /// SSH private key presented to the server.
+    #[arg(long)]
+    pub ssh_key: Option<PathBuf>,
+    /// SSH known_hosts file used to verify the server host key.
+    #[arg(long)]
+    pub known_hosts: Option<PathBuf>,
+    /// Add an unknown server host key to known_hosts without prompting.
+    #[arg(long)]
+    pub accept_new: bool,
     /// Leaf certificate presented to the server.
     #[arg(long)]
     pub identity: Option<PathBuf>,

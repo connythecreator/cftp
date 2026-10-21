@@ -12,15 +12,22 @@ blake3.workspace = true
 bytes.workspace = true
 cftp-proto = { path = "../cftp-proto" }
 directories.workspace = true
+ed25519-dalek.workspace = true
 filetime.workspace = true
 hex.workspace = true
+hmac.workspace = true
+p256.workspace = true
+p384.workspace = true
 postcard.workspace = true
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rcgen.workspace = true
+rsa.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 serde.workspace = true
+sha1.workspace = true
 sha2.workspace = true
+ssh-key.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

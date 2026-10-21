@@ -17,8 +17,9 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Semaphore, mpsc};
 
+use crate::auth::{ClientAuth, ServerAuth};
 use crate::codec::{self, CHUNK_LEVEL, PACK_LEVEL};
-use crate::identity::{DEFAULT_SERVER_NAME, Identity};
+use crate::identity::DEFAULT_SERVER_NAME;
 use crate::path;
 use crate::progress::{ProgressEvent, ProgressSender, TransferProgress};
 use crate::scan;
@@ -59,7 +60,7 @@ pub struct PushStats {
 pub async fn push(
     src: &Path,
     addr: SocketAddr,
-    identity: &Identity,
+    auth: &ClientAuth,
     opts: PushOptions,
 ) -> Result<PushStats> {
     if opts.chunk_size == 0 || opts.chunk_size > cftp_proto::MAX_DATA_PAYLOAD {
@@ -98,12 +99,20 @@ pub async fn push(
         "0.0.0.0:0".parse().expect("valid ipv4 bind address")
     };
     let mut endpoint = Endpoint::client(bind)?;
-    endpoint.set_default_client_config(identity.client_config()?);
-    let connection = endpoint
+    endpoint.set_default_client_config(auth.client_config()?);
+    let connection = match endpoint
         .connect(addr, &opts.server_name)
         .with_context(|| format!("failed to start connection to {addr}"))?
         .await
-        .with_context(|| format!("failed to connect to {addr}"))?;
+    {
+        Ok(connection) => connection,
+        Err(err) => {
+            if let Some(unknown) = auth.take_unknown_host_key() {
+                return Err(anyhow::Error::new(unknown));
+            }
+            return Err(err).with_context(|| format!("failed to connect to {addr}"));
+        }
+    };
 
     let (mut control_send, mut control_recv) = connection.open_bi().await?;
     let hello = ClientMessage::Hello(ClientHello {
@@ -690,7 +699,7 @@ pub struct ServeStats {
     pub peer: Option<SocketAddr>,
 }
 
-pub async fn serve_once(identity: &Identity, opts: ServeOptions) -> Result<ServeStats> {
+pub async fn serve_once(auth: &ServerAuth, opts: ServeOptions) -> Result<ServeStats> {
     let root = opts.root.clone();
     let meta = fs::metadata(&root)
         .with_context(|| format!("failed to inspect root {}", root.display()))?;
@@ -698,7 +707,7 @@ pub async fn serve_once(identity: &Identity, opts: ServeOptions) -> Result<Serve
         bail!("root is not a directory: {}", root.display());
     }
 
-    let endpoint = Endpoint::server(identity.server_config()?, opts.listen)?;
+    let endpoint = Endpoint::server(auth.server_config()?, opts.listen)?;
     let local_addr = endpoint.local_addr()?;
     if let Some(on_ready) = opts.on_ready {
         let _ = on_ready.send(local_addr);

@@ -113,7 +113,7 @@ impl Identity {
     }
 }
 
-fn transport_config() -> quinn::TransportConfig {
+pub(crate) fn transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(64));
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(64));

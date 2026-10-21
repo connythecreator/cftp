@@ -7,6 +7,27 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- SSH-key authentication is now the default. Clients use `~/.ssh/id_*` and
+  `~/.ssh/known_hosts`; servers use `~/.ssh/id_ed25519` as the host key and
+  verify clients against `~/.ssh/authorized_keys`.
+- First-connection host-key confirmation and `--accept-new` for scripts.
+- `--auth`, `--host-key`, `--authorized-keys`, `--ssh-key`, and
+  `--known-hosts` CLI options.
+
+### Changed
+
+- `cftp serve` and `cftp put` use SSH authentication unless certificate flags
+  are supplied or `--auth cert` is set. `cftp identity init` and certificate
+  mode remain available.
+
+### Security
+
+- SSH host keys are pinned in `known_hosts`; changed host keys are rejected.
+- `authorized_keys` options that cftp cannot enforce, such as `from=` and
+  `command=`, are ignored with a warning.
+
 ## [0.1.1] - 2026-10-20
 
 ### Changed

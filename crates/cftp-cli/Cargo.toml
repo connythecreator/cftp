@@ -19,6 +19,7 @@ anyhow.workspace = true
 cftp-core = { path = "../cftp-core" }
 clap.workspace = true
 indicatif.workspace = true
+rpassword.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -29,6 +30,7 @@ assert_cmd = "2"
 clap_complete.workspace = true
 clap_mangen.workspace = true
 predicates = "3"
+ssh-key.workspace = true
 tempfile = "3"
 
 [package.metadata.deb]
@@ -36,7 +38,7 @@ name = "cftp"
 maintainer = "Conleth <103609099@student.swin.edu.au>"
 copyright = "2026, Conleth"
 license-file = ["../../LICENSE", "0"]
-extended-description = "cftp transfers files and directory trees over QUIC with mutual TLS, zstd compression, and batched or chunked payloads."
+extended-description = "cftp transfers files and directory trees over QUIC with SSH-key authentication, zstd compression, and batched or chunked payloads. Mutual TLS remains available as an optional mode."
 section = "utils"
 priority = "optional"
 depends = "$auto"

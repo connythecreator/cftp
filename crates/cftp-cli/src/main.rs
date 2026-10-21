@@ -1,14 +1,22 @@
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use cftp_cli::cli::{Cli, Command, IdentityCommand, IdentityInitArgs, PutArgs, ServeArgs};
+use cftp_cli::cli::{
+    AuthMode, Cli, Command, IdentityCommand, IdentityInitArgs, PutArgs, ServeArgs,
+};
+use cftp_core::auth::{
+    ClientAuth, HostKeyPolicy, ServerAuth, SshClientAuth, SshServerAuth, UnknownHostKey,
+};
 use cftp_core::identity::{Identity, IdentityPaths, init_identity};
 use cftp_core::local::copy_local;
 use cftp_core::progress::{ProgressEvent, ProgressSender, TransferProgress};
+use cftp_core::ssh::{SshPaths, load_private_key};
 use cftp_core::transfer::{PushOptions, ServeOptions, push, serve_once};
+use cftp_core::trust::{AuthorizedKeys, KnownHostsStore};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::net::lookup_host;
@@ -52,18 +60,46 @@ fn init(args: IdentityInitArgs) -> Result<()> {
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
-    let defaults = IdentityPaths::user()?;
-    let identity_path = args.identity.unwrap_or(defaults.cert);
-    let key_path = args.key.unwrap_or(defaults.key);
-    let ca_path = args.client_ca.unwrap_or(defaults.ca);
-    let identity = Identity::load(&identity_path, &key_path, &ca_path)?;
+    let use_cert = matches!(args.auth, AuthMode::Cert)
+        || (matches!(args.auth, AuthMode::Auto)
+            && (args.identity.is_some() || args.key.is_some() || args.client_ca.is_some()));
+
+    let auth = if use_cert {
+        let defaults = IdentityPaths::user()?;
+        let identity_path = args.identity.unwrap_or(defaults.cert);
+        let key_path = args.key.unwrap_or(defaults.key);
+        let ca_path = args.client_ca.unwrap_or(defaults.ca);
+        let identity = Identity::load(&identity_path, &key_path, &ca_path)?;
+        println!("client CA SHA-256: {}", identity.ca_fingerprint);
+        ServerAuth::Cert(identity)
+    } else {
+        let paths = SshPaths::user()?;
+        let host_key_path = args.host_key.unwrap_or(paths.host_key);
+        let authorized_keys_path = args.authorized_keys.unwrap_or(paths.authorized_keys);
+        if !host_key_path.is_file() {
+            bail!(
+                "no SSH host key found at {}; create one with `ssh-keygen -t ed25519` or pass --host-key",
+                host_key_path.display()
+            );
+        }
+        let host_key = load_private_key(&host_key_path, prompt_passphrase)?;
+        let authorized_keys = AuthorizedKeys::load(&authorized_keys_path)?;
+        println!("host key:           {}", host_key_path.display());
+        println!("host public key:    {}", host_key.public_openssh()?);
+        println!("host fingerprint:   {}", host_key.fingerprint());
+        println!("authorized keys:    {}", authorized_keys_path.display());
+        println!(
+            "accepted keys:      {}",
+            authorized_keys.fingerprints().count()
+        );
+        ServerAuth::Ssh(SshServerAuth::new(host_key, authorized_keys))
+    };
 
     println!(
         "listening on {} (root {})",
         args.listen,
         args.root.display()
     );
-    println!("client CA SHA-256: {}", identity.ca_fingerprint);
 
     let (progress, progress_task) = progress_channel(args.quiet);
     let options = ServeOptions {
@@ -72,7 +108,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         progress: Some(progress),
         on_ready: None,
     };
-    let result = serve_once(&identity, options).await;
+    let result = serve_once(&auth, options).await;
     let _ = progress_task.await;
     let stats = result?;
     println!(
@@ -113,17 +149,51 @@ async fn put(args: PutArgs) -> Result<()> {
                 .next()
                 .with_context(|| format!("{host}:{port} did not resolve to an address"))?;
 
-            let defaults = IdentityPaths::user()?;
-            let identity_path = args.identity.unwrap_or(defaults.cert);
-            let key_path = args.key.unwrap_or(defaults.key);
-            let ca_path = args.server_ca.unwrap_or(defaults.ca);
-            let identity = Identity::load(&identity_path, &key_path, &ca_path)?;
+            let use_cert = matches!(args.auth, AuthMode::Cert)
+                || (matches!(args.auth, AuthMode::Auto)
+                    && (args.identity.is_some() || args.key.is_some() || args.server_ca.is_some()));
+
+            let auth = if use_cert {
+                let defaults = IdentityPaths::user()?;
+                let identity_path = args.identity.unwrap_or(defaults.cert);
+                let key_path = args.key.unwrap_or(defaults.key);
+                let ca_path = args.server_ca.unwrap_or(defaults.ca);
+                let identity = Identity::load(&identity_path, &key_path, &ca_path)?;
+                ClientAuth::Cert(identity)
+            } else {
+                let paths = SshPaths::user()?;
+                let key_path = match args.ssh_key {
+                    Some(path) => path,
+                    None => paths.existing_client_key().with_context(|| {
+                        format!(
+                            "no SSH private key found in {}; create one with `ssh-keygen -t ed25519` or pass --ssh-key",
+                            paths.dir.display()
+                        )
+                    })?,
+                };
+                let known_hosts_path = args.known_hosts.unwrap_or(paths.known_hosts);
+                let known_hosts = KnownHostsStore::load(&known_hosts_path)?;
+                let policy = if args.accept_new {
+                    HostKeyPolicy::AcceptNew
+                } else {
+                    HostKeyPolicy::Ask
+                };
+                let key = load_private_key(&key_path, prompt_passphrase)?;
+                ClientAuth::Ssh(SshClientAuth::new(
+                    key,
+                    known_hosts,
+                    host.clone(),
+                    port,
+                    policy,
+                ))
+            };
 
             let (progress, progress_task) = progress_channel(args.quiet);
             let options = PushOptions {
                 destination,
                 server_name: args
                     .server_name
+                    .clone()
                     .unwrap_or_else(|| cftp_core::identity::DEFAULT_SERVER_NAME.to_string()),
                 progress: Some(progress),
                 chunk_size: args.chunk_size,
@@ -132,7 +202,34 @@ async fn put(args: PutArgs) -> Result<()> {
                 small_file_max: args.small_file_max,
             };
 
-            let result = push(&args.src, addr, &identity, options).await;
+            let mut prompted = false;
+            let result = loop {
+                match push(&args.src, addr, &auth, options.clone()).await {
+                    Ok(stats) => break Ok(stats),
+                    Err(err) => {
+                        if let Some(unknown) = err.downcast_ref::<UnknownHostKey>()
+                            && !prompted
+                            && !args.accept_new
+                        {
+                            prompted = true;
+                            if confirm_unknown_host(unknown)? {
+                                if let ClientAuth::Ssh(auth) = &auth {
+                                    auth.accept_host_key(&unknown.public_key)?;
+                                    println!(
+                                        "added host key for {}:{} to {}",
+                                        unknown.host,
+                                        unknown.port,
+                                        auth.known_hosts_path().display()
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                        break Err(err);
+                    }
+                }
+            };
+            drop(options);
             let _ = progress_task.await;
             let stats = result?;
             println!(
@@ -331,4 +428,42 @@ fn format_rate(bytes_per_second: f64) -> String {
     } else {
         format!("{bits:.0} bps")
     }
+}
+
+fn prompt_passphrase(path: &Path) -> Result<String> {
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "SSH key {} is encrypted and stdin is not a terminal; decrypt it or use an unencrypted key",
+            path.display()
+        );
+    }
+    rpassword::prompt_password(format!("Passphrase for {}: ", path.display()))
+        .with_context(|| format!("failed to read passphrase for {}", path.display()))
+}
+
+fn confirm_unknown_host(unknown: &UnknownHostKey) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "the authenticity of host '{}:{}' can't be established ({}); add the key to known_hosts or pass --accept-new",
+            unknown.host,
+            unknown.port,
+            unknown.fingerprint
+        );
+    }
+
+    eprintln!(
+        "The authenticity of host '{}:{}' can't be established.",
+        unknown.host, unknown.port
+    );
+    eprintln!("Key fingerprint is {}.", unknown.fingerprint);
+    eprint!("Are you sure you want to continue connecting (yes/no)? ");
+    use std::io::Write as _;
+    std::io::stderr().flush()?;
+
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "yes" | "y"
+    ))
 }

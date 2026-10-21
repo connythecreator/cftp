@@ -7,13 +7,15 @@ Fast file and directory transfers over QUIC, with mutual TLS and zstd compressio
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://www.rust-lang.org)
 
 cftp (Connys File Transfer Program) pushes files and directory trees to a remote
-receiver over QUIC. It uses mutual TLS for authentication, zstd for compression,
-and BLAKE3 for integrity checks. Small files are packed together and large files
-are split into chunks.
+receiver over QUIC. It authenticates with SSH keys by default, uses zstd for
+compression, and BLAKE3 for integrity checks. Small files are packed together and
+large files are split into chunks.
 
 ## Features
 
-- QUIC transport with mutual TLS and ALPN `cftp/2`.
+- QUIC transport with ALPN `cftp/2`.
+- SSH-key authentication by default, using `authorized_keys` and `known_hosts`.
+- Optional mutual TLS with a local CA.
 - zstd compression, skipping known incompressible file extensions.
 - Small-file packs and offset-based chunks for large files.
 - BLAKE3 integrity checks for every pack entry and chunk.
@@ -35,6 +37,7 @@ are split into chunks.
 ## Requirements
 
 - Rust 1.88 or newer to build from source.
+- An SSH key pair, and the peer's public key in `~/.ssh/authorized_keys`.
 - UDP port `4433` (default) reachable between peers.
 - Linux, macOS, or Windows for source builds. Packages are currently Linux-only.
 - Docker if you want to build the Arch package on a non-Arch host.
@@ -77,25 +80,25 @@ cargo build --release --locked
 
 ## Quick start
 
-Both peers must trust the same CA. The simplest setup is to generate one
-identity and copy it to the other machine:
+cftp uses SSH keys by default. On the receiver, add the sender's public key to
+`~/.ssh/authorized_keys` and start the listener:
 
 ```bash
-cftp identity init
-scp ~/.config/cftp/ca.pem ~/.config/cftp/identity.pem ~/.config/cftp/identity.key peer:~/.config/cftp/
-```
-
-On the receiver:
-
-```bash
+cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
 cftp serve --root ./incoming
 ```
 
-On the sender:
+The receiver uses `~/.ssh/id_ed25519` as its host key. On the sender:
 
 ```bash
 cftp put ./project/ cftp://receiver:4433/project
 ```
+
+The sender uses the first existing key from `~/.ssh/id_ed25519`,
+`~/.ssh/id_ecdsa`, or `~/.ssh/id_rsa`, and verifies the receiver against
+`~/.ssh/known_hosts`. The first connection prints the receiver's host-key
+fingerprint and asks you to confirm it, like `scp`. In scripts, pass
+`--accept-new` to add an unknown host key automatically.
 
 The receiver writes the transfer under `./incoming/project/`. `serve` is
 one-shot: it accepts one connection, receives the transfer, then exits.
@@ -113,9 +116,19 @@ source directory name is preserved:
 cftp put ./project/ cftp://receiver:4433/destination
 ```
 
-### Using separate identities
+### Manual certificate mode
 
-You can generate an identity on each machine and exchange only the CA
+SSH authentication is the default. The original mutual-TLS mode is still
+available and is selected automatically when any certificate flag is passed, or
+explicitly with `--auth cert`:
+
+```bash
+cftp identity init
+cftp serve --root ./incoming --auth cert
+cftp put ./project/ cftp://receiver:4433/project --auth cert
+```
+
+You can still generate an identity on each machine and exchange only the CA
 certificates:
 
 - On the server, pass the client's CA with `--client-ca`.
@@ -141,9 +154,12 @@ On Linux the default directory is `~/.config/cftp`.
 | --- | --- |
 | `--root <DIR>` | Required. Directory that received files are written under. |
 | `--listen <ADDR>` | UDP address to listen on. Defaults to `0.0.0.0:4433`. |
-| `--identity <FILE>` | Leaf certificate presented to clients. |
-| `--key <FILE>` | Private key for the leaf certificate. |
-| `--client-ca <FILE>` | CA used to verify client certificates. |
+| `--auth <auto\|ssh\|cert>` | Authentication backend. Defaults to `auto`. |
+| `--host-key <FILE>` | SSH host key. Defaults to `~/.ssh/id_ed25519`. |
+| `--authorized-keys <FILE>` | SSH keys allowed to connect. Defaults to `~/.ssh/authorized_keys`. |
+| `--identity <FILE>` | Leaf certificate presented to clients (cert mode). |
+| `--key <FILE>` | Private key for the leaf certificate (cert mode). |
+| `--client-ca <FILE>` | CA used to verify client certificates (cert mode). |
 | `--quiet` | Disable the progress bar. |
 
 ### `cftp put`
@@ -152,9 +168,13 @@ On Linux the default directory is `~/.config/cftp`.
 | --- | --- |
 | `<SRC>` | Source file or directory. |
 | `<DEST>` | A `cftp://host[:port]/path` URL, or a local destination directory. |
-| `--identity <FILE>` | Leaf certificate presented to the server. |
-| `--key <FILE>` | Private key for the leaf certificate. |
-| `--server-ca <FILE>` | CA used to verify the server certificate. |
+| `--auth <auto\|ssh\|cert>` | Authentication backend. Defaults to `auto`. |
+| `--ssh-key <FILE>` | SSH private key presented to the server. Defaults to the first of `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`. |
+| `--known-hosts <FILE>` | Host keys used to verify the server. Defaults to `~/.ssh/known_hosts`. |
+| `--accept-new` | Add an unknown server host key to `known_hosts` without prompting. |
+| `--identity <FILE>` | Leaf certificate presented to the server (cert mode). |
+| `--key <FILE>` | Private key for the leaf certificate (cert mode). |
+| `--server-ca <FILE>` | CA used to verify the server certificate (cert mode). |
 | `--server-name <NAME>` | Expected server name. Defaults to `cftp.local`. |
 | `--quiet` | Disable the progress bar. |
 | `--chunk-size <BYTES>` | Large-file chunk size. Defaults to 1 MiB. |
@@ -181,8 +201,11 @@ from `sent`/`recv`.
 
 ## Security
 
-Transfers require mutual TLS, received paths are confined to the destination
-root, and files are written atomically. See
+By default, peers authenticate with SSH keys. The server checks client keys
+against `authorized_keys`, and the client pins server keys in `known_hosts`.
+Transfers protect data in transit with QUIC/TLS, received paths are confined to
+the destination root, and files are written atomically. Certificate mode remains
+available for deployments that prefer a shared CA. See
 [architecture and protocol](docs/architecture.md) for the full security model and
 [the security policy](.github/SECURITY.md) for reporting vulnerabilities.
 

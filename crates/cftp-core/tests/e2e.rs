@@ -1,6 +1,7 @@
 use std::fs;
 use std::time::Duration;
 
+use cftp_core::auth::{ClientAuth, ServerAuth};
 use cftp_core::identity::{DEFAULT_SERVER_NAME, Identity, IdentityPaths, init_identity};
 use cftp_core::progress::ProgressEvent;
 use cftp_core::transfer::{PushOptions, ServeOptions, push, serve_once};
@@ -57,6 +58,7 @@ async fn transfers_a_tree_over_mutual_tls() {
         progress: None,
         on_ready: Some(ready_tx),
     };
+    let server_identity = ServerAuth::Cert(server_identity);
     let server = tokio::spawn(async move { serve_once(&server_identity, server_opts).await });
     let addr = ready_rx.await.unwrap();
 
@@ -64,7 +66,7 @@ async fn transfers_a_tree_over_mutual_tls() {
     let push_result = push(
         &project,
         addr,
-        &client_identity,
+        &ClientAuth::Cert(client_identity),
         PushOptions {
             server_name: DEFAULT_SERVER_NAME.to_string(),
             progress: Some(progress_tx),
@@ -249,6 +251,7 @@ async fn rejects_invalid_destination_without_hanging() {
     fs::create_dir_all(&dest).unwrap();
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let server_identity = ServerAuth::Cert(server_identity);
     let server = tokio::spawn(async move {
         serve_once(
             &server_identity,
@@ -268,7 +271,7 @@ async fn rejects_invalid_destination_without_hanging() {
         push(
             &source,
             addr,
-            &client_identity,
+            &ClientAuth::Cert(client_identity),
             PushOptions {
                 destination: "../escape".to_string(),
                 server_name: DEFAULT_SERVER_NAME.to_string(),
@@ -321,5 +324,94 @@ async fn local_copy_normalizes_parent_components() {
         temp.path()
             .join("sample-copy/sample-project/file.txt")
             .exists()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transfers_a_tree_over_ssh_keys() {
+    use cftp_core::auth::{HostKeyPolicy, SshClientAuth, SshServerAuth};
+    use cftp_core::ssh::{SshPublicKey, from_private_key};
+    use cftp_core::trust::{AuthorizedKeys, KnownHostsStore, canonical_host};
+    use ssh_key::rand_core::OsRng;
+
+    let temp = tempfile::tempdir().unwrap();
+    let server_private =
+        ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let client_private =
+        ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+
+    let server_public = SshPublicKey::from_ssh(server_private.public_key().clone()).unwrap();
+    let client_public = SshPublicKey::from_ssh(client_private.public_key().clone()).unwrap();
+
+    let authorized_keys_path = temp.path().join("authorized_keys");
+    fs::write(
+        &authorized_keys_path,
+        format!("{}\n", client_public.public_openssh().unwrap()),
+    )
+    .unwrap();
+
+    let server_auth = ServerAuth::Ssh(SshServerAuth::new(
+        from_private_key(server_private).unwrap(),
+        AuthorizedKeys::load(&authorized_keys_path).unwrap(),
+    ));
+
+    let project = temp.path().join("src/project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/main.js"), b"console.log('ssh')\n").unwrap();
+
+    let dest = temp.path().join("dst");
+    fs::create_dir_all(&dest).unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let server_dest = dest.clone();
+    let server = tokio::spawn(async move {
+        serve_once(
+            &server_auth,
+            ServeOptions {
+                root: server_dest,
+                listen: "127.0.0.1:0".parse().unwrap(),
+                progress: None,
+                on_ready: Some(ready_tx),
+            },
+        )
+        .await
+    });
+    let addr = ready_rx.await.unwrap();
+
+    let known_hosts_path = temp.path().join("known_hosts");
+    fs::write(
+        &known_hosts_path,
+        format!(
+            "{} {}\n",
+            canonical_host("127.0.0.1", addr.port()),
+            server_public.public_openssh().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let client_auth = ClientAuth::Ssh(SshClientAuth::new(
+        from_private_key(client_private).unwrap(),
+        KnownHostsStore::load(&known_hosts_path).unwrap(),
+        "127.0.0.1",
+        addr.port(),
+        HostKeyPolicy::Strict,
+    ));
+
+    let stats = push(
+        &project,
+        addr,
+        &client_auth,
+        PushOptions {
+            server_name: DEFAULT_SERVER_NAME.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    server.await.unwrap().unwrap();
+
+    assert_eq!(stats.files, 1);
+    assert_eq!(
+        fs::read(dest.join("project/src/main.js")).unwrap(),
+        b"console.log('ssh')\n"
     );
 }

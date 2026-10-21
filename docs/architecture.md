@@ -3,8 +3,8 @@
 cftp is split into three crates:
 
 - `cftp-proto` defines wire types and framing.
-- `cftp-core` implements scanning, path safety, compression, identity/TLS, and the
-  transfer engine.
+- `cftp-core` implements scanning, path safety, compression, SSH/TLS
+  authentication, and the transfer engine.
 - `cftp-cli` provides the `cftp` binary.
 
 ## Transfer flow
@@ -61,19 +61,41 @@ Rates are application-level estimates over a short window, not operating system
 interface counters. Compression means `read` and `write` can differ substantially
 from `sent` and `recv`.
 
+## Authentication
+
+SSH authentication is the default. cftp does not speak the SSH transport; it
+uses SSH keys as TLS raw public keys over QUIC:
+
+- The client loads `~/.ssh/id_ed25519`, `id_ecdsa`, or `id_rsa`.
+- The server loads its host key (default `~/.ssh/id_ed25519`) and
+  `~/.ssh/authorized_keys`.
+- Each key is normalized to PKCS#8 for signing and to a SubjectPublicKeyInfo
+  (SPKI) for identification.
+- Custom rustls verifiers compare the peer's SPKI against `authorized_keys` or
+  `known_hosts`. TLS proves possession of the private key, so no separate
+  challenge is required.
+- Unknown host keys prompt for confirmation, or are added with `--accept-new`.
+  A changed host key always fails.
+- `known_hosts` wildcards, port entries, hashed entries, and `@revoked` markers
+  are supported. SSH certificates and `ssh-agent` are not.
+- `authorized_keys` entries with security-relevant options that cftp cannot
+  enforce, such as `from=` and `command=`, are ignored with a warning.
+
+Certificate mode remains available with `--auth cert`. It uses mutual TLS with a
+shared local CA, as before.
+
 ## Security model
 
-- Transfers require mutual TLS. Each peer verifies the other against the
-  configured CA.
+- Transfers require mutual authentication: SSH key pinning by default, or
+  mutual TLS in certificate mode.
 - Received paths are normalized and rejected if they are absolute, contain
   `..`, or escape the destination through a symlink.
 - Files are written to temporary files and renamed into place only after they
   are complete.
 - QUIC protects data in transit. cftp does not add application-layer encryption
   beyond TLS.
-- Restrict the UDP port to peers you trust. The default identity layout uses the
-  same private key for client and server authentication, so protect
-  `identity.key`.
+- Restrict the UDP port to peers you trust. Protect SSH private keys and
+  `identity.key` with restrictive file permissions.
 
 To report a vulnerability, see [the security policy](../.github/SECURITY.md).
 
@@ -81,6 +103,7 @@ To report a vulnerability, see [the security policy](../.github/SECURITY.md).
 
 - `serve` handles one connection per process.
 - Transfers are not resumed across sessions; interrupted transfers restart.
+- `ssh-agent` and SSH certificate authentication are not supported yet.
 - Filenames must be valid UTF-8. On Unix, filenames containing backslashes are
   not preserved.
 - Symlink creation is supported on Unix only.
