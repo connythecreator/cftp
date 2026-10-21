@@ -349,3 +349,57 @@ fn loopback_serve_and_put_with_ssh_keys() {
         "known_hosts did not receive the server key: {known_hosts_contents}"
     );
 }
+
+#[test]
+fn hardware_profile_flags_are_mutually_exclusive() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("source.txt");
+    fs::write(&source, b"hello\n").unwrap();
+
+    cftp()
+        .arg("put")
+        .arg(&source)
+        .arg(temp.path().join("dst"))
+        .arg("--light")
+        .arg("--aggressive")
+        .assert()
+        .failure();
+}
+
+#[test]
+fn hardware_profiles_conflict_with_explicit_tuning() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("source.txt");
+    fs::write(&source, b"hello\n").unwrap();
+
+    cftp()
+        .arg("put")
+        .arg(&source)
+        .arg(temp.path().join("dst"))
+        .arg("--aggressive")
+        .arg("--chunk-size")
+        .arg("1024")
+        .assert()
+        .failure();
+}
+
+#[test]
+fn help_lists_hardware_profiles() {
+    cftp()
+        .arg("put")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--light"))
+        .stdout(predicate::str::contains("--default"))
+        .stdout(predicate::str::contains("--aggressive"));
+
+    cftp()
+        .arg("serve")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--light"))
+        .stdout(predicate::str::contains("--default"))
+        .stdout(predicate::str::contains("--aggressive"));
+}

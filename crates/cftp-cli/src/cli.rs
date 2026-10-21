@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use cftp_core::tuning::HardwareProfile;
+
 #[derive(Parser)]
 #[command(name = "cftp", version, about = "Fast file transfers over QUIC")]
 pub struct Cli {
@@ -52,6 +54,34 @@ pub enum AuthMode {
     Cert,
 }
 
+#[derive(Args, Debug, Clone, Copy, Default)]
+#[command(group = clap::ArgGroup::new("hardware").args(["light", "default_profile", "aggressive"]).multiple(false))]
+pub struct HardwareArgs {
+    /// Minimize CPU, memory, and network usage.
+    #[arg(long)]
+    pub light: bool,
+    /// Use the default tuning.
+    #[arg(long = "default")]
+    pub default_profile: bool,
+    /// Saturate available CPU, memory, and network.
+    #[arg(long)]
+    pub aggressive: bool,
+}
+
+impl HardwareArgs {
+    pub fn selected(self) -> Option<HardwareProfile> {
+        if self.light {
+            Some(HardwareProfile::Light)
+        } else if self.aggressive {
+            Some(HardwareProfile::Aggressive)
+        } else if self.default_profile {
+            Some(HardwareProfile::Default)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Args)]
 pub struct ServeArgs {
     /// Directory that received files are written under.
@@ -69,6 +99,9 @@ pub struct ServeArgs {
     /// UDP address to listen on.
     #[arg(long, default_value = "0.0.0.0:4433")]
     pub listen: SocketAddr,
+    /// Maximum hardware profile the server will accept.
+    #[command(flatten)]
+    pub hardware: HardwareArgs,
     /// Leaf certificate presented to clients.
     #[arg(long)]
     pub identity: Option<PathBuf>,
@@ -125,16 +158,19 @@ pub struct PutArgs {
     /// Do not render a progress bar.
     #[arg(long)]
     pub quiet: bool,
+    /// Hardware profile. Hotkeys can change it during the transfer.
+    #[command(flatten)]
+    pub hardware: HardwareArgs,
     /// Size of large-file chunks in bytes.
-    #[arg(long, default_value_t = 1024 * 1024)]
-    pub chunk_size: usize,
+    #[arg(long, conflicts_with = "hardware")]
+    pub chunk_size: Option<usize>,
     /// Target size of a small-file pack in bytes.
-    #[arg(long, default_value_t = 4 * 1024 * 1024)]
-    pub pack_target: usize,
+    #[arg(long, conflicts_with = "hardware")]
+    pub pack_target: Option<usize>,
     /// Maximum files per small-file pack.
-    #[arg(long, default_value_t = 128)]
-    pub pack_max_files: usize,
+    #[arg(long, conflicts_with = "hardware")]
+    pub pack_max_files: Option<usize>,
     /// Files at or below this size are packed.
-    #[arg(long, default_value_t = 2 * 1024 * 1024)]
-    pub small_file_max: u64,
+    #[arg(long, conflicts_with = "hardware")]
+    pub small_file_max: Option<u64>,
 }

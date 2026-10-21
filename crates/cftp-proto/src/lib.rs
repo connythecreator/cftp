@@ -6,8 +6,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const ALPN: &[u8] = b"cftp/2";
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const ALPN_V2: &[u8] = b"cftp/2";
+pub const ALPN_V3: &[u8] = b"cftp/3";
+pub const PROTOCOL_VERSION_V2: u16 = 2;
+pub const PROTOCOL_VERSION_V3: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V3;
 pub const MAX_CONTROL_FRAME: usize = 256 * 1024 * 1024;
 pub const MAX_DATA_PAYLOAD: usize = 64 * 1024 * 1024;
 
@@ -26,6 +29,30 @@ pub enum ProtoError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransferMode {
     Push,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+pub enum HardwareProfile {
+    Light,
+    #[default]
+    Default,
+    Aggressive,
+}
+
+impl HardwareProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Default => "default",
+            Self::Aggressive => "aggressive",
+        }
+    }
+}
+
+impl std::fmt::Display for HardwareProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +87,25 @@ pub struct ServerHello {
     pub version: u16,
     pub accepted: bool,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientHelloV3 {
+    pub version: u16,
+    pub mode: TransferMode,
+    pub destination: String,
+    pub entries: Vec<ManifestEntry>,
+    pub profile: HardwareProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerHelloV3 {
+    pub version: u16,
+    pub accepted: bool,
+    pub message: String,
+    pub effective_profile: HardwareProfile,
+    pub server_cap: HardwareProfile,
+    pub profile_accepted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,11 +181,37 @@ pub enum ClientMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ClientMessageV3 {
+    Hello(ClientHelloV3),
+    Complete(Complete),
+    Abort(Abort),
+    SetProfile {
+        request_id: u64,
+        profile: HardwareProfile,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMessage {
     Hello(ServerHello),
     Done(Done),
     Error(Abort),
     Progress(ServerProgress),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ServerMessageV3 {
+    Hello(ServerHelloV3),
+    Done(Done),
+    Error(Abort),
+    Progress(ServerProgress),
+    ProfileChanged {
+        request_id: u64,
+        accepted: bool,
+        effective_profile: HardwareProfile,
+        server_cap: HardwareProfile,
+        message: String,
+    },
 }
 
 pub async fn write_frame<W, T>(writer: &mut W, value: &T) -> Result<(), ProtoError>
@@ -189,7 +261,7 @@ mod tests {
     #[test]
     fn manifest_roundtrip() {
         let msg = ClientMessage::Hello(ClientHello {
-            version: PROTOCOL_VERSION,
+            version: PROTOCOL_VERSION_V2,
             mode: TransferMode::Push,
             destination: "dest".into(),
             entries: vec![ManifestEntry {
@@ -228,6 +300,62 @@ mod tests {
                 assert_eq!(progress.received_bytes, 50);
                 assert_eq!(progress.written_bytes, 40);
                 assert_eq!(progress.elapsed_millis, 250);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn profiles_are_ordered_for_caps() {
+        assert!(HardwareProfile::Light < HardwareProfile::Default);
+        assert!(HardwareProfile::Default < HardwareProfile::Aggressive);
+        assert_eq!(
+            HardwareProfile::Aggressive.min(HardwareProfile::Default),
+            HardwareProfile::Default
+        );
+    }
+
+    #[test]
+    fn v3_hello_and_profile_change_roundtrip() {
+        let hello = ClientMessageV3::Hello(ClientHelloV3 {
+            version: PROTOCOL_VERSION_V3,
+            mode: TransferMode::Push,
+            destination: "dest".into(),
+            entries: Vec::new(),
+            profile: HardwareProfile::Aggressive,
+        });
+        let decoded: ClientMessageV3 = decode(&encode(&hello).unwrap()).unwrap();
+        match decoded {
+            ClientMessageV3::Hello(hello) => {
+                assert_eq!(hello.version, PROTOCOL_VERSION_V3);
+                assert_eq!(hello.profile, HardwareProfile::Aggressive);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let changed = ServerMessageV3::ProfileChanged {
+            request_id: 7,
+            accepted: false,
+            effective_profile: HardwareProfile::Default,
+            server_cap: HardwareProfile::Default,
+            message: "capped".into(),
+        };
+        let decoded: ServerMessageV3 = decode(&encode(&changed).unwrap()).unwrap();
+        match decoded {
+            ServerMessageV3::ProfileChanged {
+                request_id,
+                accepted,
+                effective_profile,
+                ..
+            } => {
+                assert_eq!(request_id, 7);
+                assert!(!accepted);
+                assert_eq!(effective_profile, HardwareProfile::Default);
             }
             _ => panic!("wrong variant"),
         }

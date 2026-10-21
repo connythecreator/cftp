@@ -9,30 +9,45 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use cftp_proto::{
-    Abort, ChunkHeader, ClientHello, ClientMessage, Codec, Complete, DataHeader, Done, EntryKind,
-    ManifestEntry, PROTOCOL_VERSION, PackEntry, PackHeader, ServerHello, ServerMessage,
-    ServerProgress, TransferMode,
+    Abort, ChunkHeader, Codec, Complete, DataHeader, Done, EntryKind, HardwareProfile,
+    ManifestEntry, PackEntry, PackHeader, ServerProgress, TransferMode,
 };
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::auth::{ClientAuth, ServerAuth};
-use crate::codec::{self, CHUNK_LEVEL, PACK_LEVEL};
+use crate::codec;
 use crate::identity::DEFAULT_SERVER_NAME;
+use crate::link::{NetworkOptimizer, NetworkSample, compression_levels, detect_link_speed};
 use crate::path;
 use crate::progress::{ProgressEvent, ProgressSender, TransferProgress};
 use crate::scan;
+use crate::tuning::{MAX_INFLIGHT_SENDS, Tuning, TuningController, apply_connection_tuning};
+type ServerMessageResult = Result<IncomingServer, anyhow::Error>;
+type ClientMessageResult = Result<IncomingClient, anyhow::Error>;
+type ServerMessageSender = mpsc::UnboundedSender<ServerMessageResult>;
+type ServerMessageReceiver = mpsc::UnboundedReceiver<ServerMessageResult>;
+type ClientMessageSender = mpsc::UnboundedSender<ClientMessageResult>;
+type ClientMessageReceiver = mpsc::UnboundedReceiver<ClientMessageResult>;
+
+use crate::wire::{
+    HelloInfo, IncomingClient, IncomingServer, ServerHelloInfo, WireVersion, negotiated_version,
+    read_client_hello, read_client_message, read_server_hello, read_server_message,
+    write_client_hello, write_complete, write_profile_changed, write_server_done,
+    write_server_error, write_server_hello, write_server_progress, write_set_profile,
+};
 
 #[derive(Debug, Clone)]
 pub struct PushOptions {
     pub destination: String,
     pub server_name: String,
     pub progress: Option<ProgressSender>,
-    pub chunk_size: usize,
-    pub pack_target: usize,
-    pub pack_max_files: usize,
-    pub small_file_max: u64,
+    pub profile: HardwareProfile,
+    pub tuning: Tuning,
+    pub profile_flag_used: bool,
+    pub force_v2: bool,
+    pub profile_requests: Option<watch::Receiver<HardwareProfile>>,
 }
 
 impl Default for PushOptions {
@@ -41,10 +56,11 @@ impl Default for PushOptions {
             destination: String::new(),
             server_name: DEFAULT_SERVER_NAME.to_string(),
             progress: None,
-            chunk_size: 1024 * 1024,
-            pack_target: 4 * 1024 * 1024,
-            pack_max_files: 128,
-            small_file_max: 2 * 1024 * 1024,
+            profile: HardwareProfile::Default,
+            tuning: Tuning::default(),
+            profile_flag_used: false,
+            force_v2: false,
+            profile_requests: None,
         }
     }
 }
@@ -55,6 +71,7 @@ pub struct PushStats {
     pub bytes: u64,
     pub packs: u64,
     pub chunks: u64,
+    pub effective_profile: HardwareProfile,
 }
 
 pub async fn push(
@@ -63,29 +80,9 @@ pub async fn push(
     auth: &ClientAuth,
     opts: PushOptions,
 ) -> Result<PushStats> {
-    if opts.chunk_size == 0 || opts.chunk_size > cftp_proto::MAX_DATA_PAYLOAD {
-        bail!(
-            "chunk size must be between 1 and {} bytes",
-            cftp_proto::MAX_DATA_PAYLOAD
-        );
-    }
-    if opts.pack_target == 0 || opts.pack_target > cftp_proto::MAX_DATA_PAYLOAD {
-        bail!(
-            "pack target must be between 1 and {} bytes",
-            cftp_proto::MAX_DATA_PAYLOAD
-        );
-    }
-    if opts.small_file_max > cftp_proto::MAX_DATA_PAYLOAD as u64 {
-        bail!(
-            "small-file threshold cannot exceed {} bytes",
-            cftp_proto::MAX_DATA_PAYLOAD
-        );
-    }
-    if opts.pack_max_files == 0 {
-        bail!("pack max files must be greater than zero");
-    }
+    validate_tuning(&opts.tuning)?;
 
-    let scan = scan::scan_source(src)?;
+    let scan: scan::ScanResult = scan::scan_source(src)?;
     if let Some(progress) = &opts.progress {
         let _ = progress.send(ProgressEvent::Scan {
             files: scan.total_files,
@@ -98,9 +95,9 @@ pub async fn push(
     } else {
         "0.0.0.0:0".parse().expect("valid ipv4 bind address")
     };
-    let mut endpoint = Endpoint::client(bind)?;
-    endpoint.set_default_client_config(auth.client_config()?);
-    let connection = match endpoint
+    let mut endpoint: Endpoint = Endpoint::client(bind)?;
+    endpoint.set_default_client_config(auth.client_config(&opts.tuning, opts.force_v2)?);
+    let connection: Connection = match endpoint
         .connect(addr, &opts.server_name)
         .with_context(|| format!("failed to start connection to {addr}"))?
         .await
@@ -114,31 +111,101 @@ pub async fn push(
         }
     };
 
-    let (mut control_send, mut control_recv) = connection.open_bi().await?;
-    let hello = ClientMessage::Hello(ClientHello {
-        version: PROTOCOL_VERSION,
-        mode: TransferMode::Push,
-        destination: opts.destination.clone(),
-        entries: scan.entries.clone(),
-    });
-    cftp_proto::write_frame(&mut control_send, &hello).await?;
+    let wire: WireVersion = if opts.force_v2 {
+        WireVersion::V2
+    } else {
+        negotiated_version(&connection)
+    };
 
-    let response: ServerMessage = cftp_proto::read_frame(&mut control_recv).await?;
-    match response {
-        ServerMessage::Hello(hello) => {
-            if !hello.accepted {
-                bail!("server rejected transfer: {}", hello.message);
-            }
-        }
-        ServerMessage::Error(err) => bail!("server error: {}", err.message),
-        ServerMessage::Progress(_) => bail!("server sent progress before accepting the transfer"),
-        ServerMessage::Done(_) => bail!("server completed before receiving data"),
+    let (mut control_send, mut control_recv): (SendStream, RecvStream) =
+        connection.open_bi().await?;
+    write_client_hello(
+        &mut control_send,
+        wire,
+        &HelloInfo {
+            version: if wire == WireVersion::V3 {
+                cftp_proto::PROTOCOL_VERSION_V3
+            } else {
+                cftp_proto::PROTOCOL_VERSION_V2
+            },
+            mode: TransferMode::Push,
+            destination: opts.destination.clone(),
+            entries: scan.entries.clone(),
+            profile: opts.profile,
+        },
+    )
+    .await?;
+
+    let server_hello: ServerHelloInfo = read_server_hello(&mut control_recv, wire).await?;
+    if !server_hello.accepted {
+        bail!("server rejected transfer: {}", server_hello.message);
     }
 
-    let (server_tx, mut server_rx) = mpsc::unbounded_channel::<Result<ServerMessage, _>>();
-    let control_task = tokio::spawn(async move {
+    let mut effective_profile: HardwareProfile = if wire == WireVersion::V3 {
+        server_hello.effective_profile
+    } else {
+        HardwareProfile::Default
+    };
+    let server_cap: HardwareProfile = if wire == WireVersion::V3 {
+        server_hello.server_cap
+    } else {
+        HardwareProfile::Default
+    };
+    let mut link_speed: Option<u64> = if effective_profile == HardwareProfile::Aggressive {
+        detect_link_speed(addr.ip())
+    } else {
+        None
+    };
+
+    let mut initial_tuning: Tuning = if wire == WireVersion::V2 {
+        if opts.profile_flag_used {
+            Tuning::default()
+        } else {
+            opts.tuning.clone()
+        }
+    } else if effective_profile == opts.profile {
+        opts.tuning.clone()
+    } else {
+        Tuning::for_profile(effective_profile, link_speed)
+    };
+    initial_tuning.profile = effective_profile;
+    if effective_profile == HardwareProfile::Aggressive {
+        let (chunk, pack): (i32, i32) = compression_levels(effective_profile, link_speed);
+        initial_tuning.chunk_zstd_level = chunk;
+        initial_tuning.pack_zstd_level = pack;
+    }
+    let controller: Arc<TuningController> = TuningController::new(initial_tuning);
+    apply_connection_tuning(&connection, &controller.snapshot());
+
+    if wire == WireVersion::V3
+        && (!server_hello.profile_accepted || effective_profile != opts.profile)
+    {
+        notice(
+            &opts,
+            format!(
+                "profile: requested {}, server cap {}, effective {}{}",
+                opts.profile,
+                server_cap,
+                effective_profile,
+                if server_hello.profile_accepted {
+                    ""
+                } else {
+                    " (request rejected)"
+                }
+            ),
+        );
+    } else if wire == WireVersion::V2 && opts.profile_flag_used {
+        notice(
+            &opts,
+            "profile flags are ignored because the peer only supports cftp/2".to_string(),
+        );
+    }
+
+    let (server_tx, mut server_rx): (ServerMessageSender, ServerMessageReceiver) =
+        mpsc::unbounded_channel::<ServerMessageResult>();
+    let control_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
         loop {
-            match cftp_proto::read_frame::<_, ServerMessage>(&mut control_recv).await {
+            match read_server_message(&mut control_recv, wire).await {
                 Ok(message) => {
                     if server_tx.send(Ok(message)).is_err() {
                         break;
@@ -152,23 +219,94 @@ pub async fn push(
         }
     });
 
-    let totals = Totals {
+    let totals: Totals = Totals {
         files: scan.total_files,
         bytes: scan.total_bytes,
     };
-    let mut stats = PushStats::default();
-    let mut state = SendState::default();
+    let mut stats: PushStats = PushStats {
+        effective_profile,
+        ..Default::default()
+    };
+    let mut state: SendState = SendState::default();
 
-    let (tx, mut rx) = mpsc::channel::<Result<EncodedItem>>(MAX_INFLIGHT_SENDS);
-    let producer = tokio::spawn(produce_items(scan.clone(), opts.clone(), tx));
-    let mut sends = tokio::task::JoinSet::new();
+    let (tx, mut rx): (
+        mpsc::Sender<Result<EncodedItem>>,
+        mpsc::Receiver<Result<EncodedItem>>,
+    ) = mpsc::channel::<Result<EncodedItem>>(MAX_INFLIGHT_SENDS);
+    let producer: tokio::task::JoinHandle<()> =
+        tokio::spawn(produce_items(scan.clone(), controller.clone(), tx));
+    let mut sends: tokio::task::JoinSet<Result<SentItem>> = tokio::task::JoinSet::new();
+    let mut profile_rx: Option<watch::Receiver<HardwareProfile>> = opts.profile_requests.clone();
+    let mut has_hotkeys: bool = profile_rx.is_some();
+    let mut pending_request: Option<u64> = None;
+    let mut next_request_id: u64 = 1u64;
+
+    let mut optimizer: Option<NetworkOptimizer> =
+        (wire == WireVersion::V3 && effective_profile == HardwareProfile::Aggressive).then(|| {
+            let snapshot = controller.snapshot();
+            NetworkOptimizer::new(
+                snapshot.chunk_zstd_level,
+                snapshot.pack_zstd_level,
+                Instant::now(),
+            )
+        });
+    let mut adaptive: bool = optimizer.is_some();
+    let mut optimizer_tick: tokio::time::Interval = tokio::time::interval(Duration::from_secs(3));
+    optimizer_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    optimizer_tick.tick().await;
+    let mut last_sample: Option<SampleState> = None;
+    let mut last_link_check: Instant = Instant::now() - Duration::from_secs(10);
+
     loop {
         tokio::select! {
             biased;
             message = server_rx.recv() => {
                 match message {
                     Some(Ok(message)) => {
-                        if apply_server_message(message, &mut state, &opts, totals)?.is_some() {
+                        if let IncomingServer::ProfileChanged {
+                            request_id,
+                            accepted,
+                            effective_profile: new_profile,
+                            server_cap: new_cap,
+                            message,
+                        } = message
+                        {
+                            if pending_request.take() == Some(request_id) {
+                                effective_profile = new_profile;
+                                let link = if effective_profile == HardwareProfile::Aggressive {
+                                    link_speed = detect_link_speed(addr.ip());
+                                    link_speed
+                                } else {
+                                    None
+                                };
+                                controller.set_profile(effective_profile, link);
+                                apply_connection_tuning(&connection, &controller.snapshot());
+                                let snapshot = controller.snapshot();
+                                optimizer = (wire == WireVersion::V3
+                                    && effective_profile == HardwareProfile::Aggressive)
+                                    .then(|| NetworkOptimizer::new(
+                                        snapshot.chunk_zstd_level,
+                                        snapshot.pack_zstd_level,
+                                        Instant::now(),
+                                    ));
+                                last_sample = None;
+                                notice(
+                                    &opts,
+                                    format!(
+                                        "profile request {}: {}, effective {} (server cap {}){}",
+                                        request_id,
+                                        if accepted { "accepted" } else { "rejected" },
+                                        effective_profile,
+                                        new_cap,
+                                        if message.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(": {message}")
+                                        }
+                                    ),
+                                );
+                            }
+                        } else if apply_server_message(message, &mut state, &opts, totals)?.is_some() {
                             bail!("server completed before receiving data");
                         }
                     }
@@ -176,8 +314,84 @@ pub async fn push(
                     None => bail!("server closed control stream before completion"),
                 }
             }
+            profile = next_profile(&mut profile_rx), if has_hotkeys => {
+                match profile {
+                    Some(profile) => {
+                        if wire == WireVersion::V2 {
+                            notice(&opts, "profile hotkeys are unavailable on cftp/2".to_string());
+                        } else {
+                            let request_id: u64 = next_request_id;
+                            next_request_id += 1;
+                            write_set_profile(&mut control_send, request_id, profile).await?;
+                            pending_request = Some(request_id);
+                            notice(&opts, format!("requesting {} profile", profile));
+                        }
+                    }
+                    None => has_hotkeys = false,
+                }
+            }
+            _ = optimizer_tick.tick(), if adaptive => {
+                if wire == WireVersion::V3 && effective_profile == HardwareProfile::Aggressive {
+                    let now: Instant = Instant::now();
+                    if now.duration_since(last_link_check) >= Duration::from_secs(10) {
+                        last_link_check = now;
+                        let detected: Option<u64> = detect_link_speed(addr.ip());
+                        if detected != link_speed {
+                            link_speed = detected;
+                            let (chunk, pack): (i32, i32) =
+                                compression_levels(HardwareProfile::Aggressive, link_speed);
+                            controller.set_compression(chunk, pack);
+                            if let Some(optimizer) = &mut optimizer {
+                                optimizer.reset(chunk, pack, now);
+                            }
+                        }
+                    }
+                    if let Some(previous) = last_sample {
+                        let previous: SampleState = previous;
+                        let elapsed: f64 = now.duration_since(previous.at).as_secs_f64();
+                        if elapsed >= 2.0 {
+                            let path: quinn::PathStats = connection.stats().path;
+                            let sample: NetworkSample = NetworkSample {
+                                link_speed,
+                                wire_bps: (state.sent_bytes.saturating_sub(previous.sent_bytes)) as f64 * 8.0 / elapsed,
+                                rtt: path.rtt,
+                                min_rtt: path.min_rtt,
+                                lost_bytes: path.lost_bytes.saturating_sub(previous.lost_bytes),
+                                sent_bytes: state.sent_bytes.saturating_sub(previous.sent_bytes),
+                            };
+                            if let Some(optimizer) = &mut optimizer
+                                && let Some((chunk, pack)) = optimizer.observe(&sample, now)
+                            {
+                                controller.set_compression(chunk, pack);
+                                notice(
+                                    &opts,
+                                    format!(
+                                        "adaptive zstd levels: chunk {chunk}, pack {pack} (link {}, wire {:.1} Mbps)",
+                                        link_speed
+                                            .map(|speed| format!("{:.0} Mbps", speed as f64 / 1_000_000.0))
+                                            .unwrap_or_else(|| "unknown".to_string()),
+                                        sample.wire_bps / 1_000_000.0,
+                                    ),
+                                );
+                            }
+                            last_sample = Some(SampleState {
+                                at: now,
+                                sent_bytes: state.sent_bytes,
+                                lost_bytes: path.lost_bytes,
+                            });
+                        }
+                    } else {
+                        last_sample = Some(SampleState {
+                            at: now,
+                            sent_bytes: state.sent_bytes,
+                            lost_bytes: connection.stats().path.lost_bytes,
+                        });
+                    }
+                }
+            }
             result = sends.join_next(), if !sends.is_empty() => {
-                let result = result.expect("send set is not empty");
+                let result: Result<Result<SentItem>, tokio::task::JoinError> =
+                    result.expect("send set is not empty");
                 apply_sent_item(
                     result.context("send task panicked")??,
                     &mut stats,
@@ -185,15 +399,19 @@ pub async fn push(
                     &opts,
                     totals,
                 );
-                drain_server_messages(&mut server_rx, &mut state, &opts, totals)?;
             }
             item = rx.recv() => {
-                let Some(item) = item else {
+                let Some(item): Option<Result<EncodedItem>> = item else {
                     break;
                 };
-                let item = item?;
-                while sends.len() >= MAX_INFLIGHT_SENDS {
-                    let result = sends.join_next().await.expect("send set is not empty");
+                let item: EncodedItem = item?;
+                loop {
+                    let limit: usize = controller.snapshot().max_inflight_sends;
+                    if sends.len() < limit {
+                        break;
+                    }
+                    let result: Result<Result<SentItem>, tokio::task::JoinError> =
+                        sends.join_next().await.expect("send set is not empty");
                     apply_sent_item(
                         result.context("send task panicked")??,
                         &mut stats,
@@ -201,12 +419,12 @@ pub async fn push(
                         &opts,
                         totals,
                     );
-                    drain_server_messages(&mut server_rx, &mut state, &opts, totals)?;
                 }
-                let connection = connection.clone();
+                let connection: Connection = connection.clone();
                 sends.spawn(async move { send_item(&connection, item).await });
             }
         }
+        adaptive = wire == WireVersion::V3 && effective_profile == HardwareProfile::Aggressive;
     }
     while let Some(result) = sends.join_next().await {
         apply_sent_item(
@@ -216,20 +434,20 @@ pub async fn push(
             &opts,
             totals,
         );
-        drain_server_messages(&mut server_rx, &mut state, &opts, totals)?;
     }
     producer.await.context("producer task panicked")?;
 
-    cftp_proto::write_frame(
+    write_complete(
         &mut control_send,
-        &ClientMessage::Complete(Complete {
+        wire,
+        Complete {
             files: stats.files,
             bytes: stats.bytes,
-        }),
+        },
     )
     .await?;
 
-    let done = loop {
+    let done: Done = loop {
         match server_rx.recv().await {
             Some(Ok(message)) => {
                 if let Some(done) = apply_server_message(message, &mut state, &opts, totals)? {
@@ -244,6 +462,7 @@ pub async fn push(
 
     stats.files = done.files;
     stats.bytes = done.bytes;
+    stats.effective_profile = effective_profile;
 
     if let Some(progress) = &opts.progress {
         let _ = progress.send(ProgressEvent::Complete {
@@ -256,8 +475,60 @@ pub async fn push(
     Ok(stats)
 }
 
-const MAX_INFLIGHT_SENDS: usize = 32;
-const MAX_INFLIGHT_STREAMS: usize = 32;
+#[derive(Clone, Copy)]
+struct SampleState {
+    at: Instant,
+    sent_bytes: u64,
+    lost_bytes: u64,
+}
+
+async fn next_profile(
+    rx: &mut Option<watch::Receiver<HardwareProfile>>,
+) -> Option<HardwareProfile> {
+    match rx {
+        Some(rx) => match rx.changed().await {
+            Ok(()) => Some(*rx.borrow_and_update()),
+            Err(_) => None,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+fn notice(opts: &PushOptions, message: String) {
+    if let Some(progress) = &opts.progress {
+        let _ = progress.send(ProgressEvent::Notice(message));
+    } else {
+        tracing::info!("{message}");
+    }
+}
+
+fn validate_tuning(tuning: &Tuning) -> Result<()> {
+    if tuning.chunk_size == 0 || tuning.chunk_size > cftp_proto::MAX_DATA_PAYLOAD {
+        bail!(
+            "chunk size must be between 1 and {} bytes",
+            cftp_proto::MAX_DATA_PAYLOAD
+        );
+    }
+    if tuning.pack_target == 0 || tuning.pack_target > cftp_proto::MAX_DATA_PAYLOAD {
+        bail!(
+            "pack target must be between 1 and {} bytes",
+            cftp_proto::MAX_DATA_PAYLOAD
+        );
+    }
+    if tuning.small_file_max > cftp_proto::MAX_DATA_PAYLOAD as u64 {
+        bail!(
+            "small-file threshold cannot exceed {} bytes",
+            cftp_proto::MAX_DATA_PAYLOAD
+        );
+    }
+    if tuning.pack_max_files == 0 {
+        bail!("pack max files must be greater than zero");
+    }
+    if tuning.max_inflight_sends == 0 || tuning.max_inflight_streams == 0 {
+        bail!("in-flight limits must be greater than zero");
+    }
+    Ok(())
+}
 
 #[derive(Debug, Default)]
 struct SendState {
@@ -271,42 +542,24 @@ struct SendState {
 }
 
 fn apply_server_message(
-    message: ServerMessage,
+    message: IncomingServer,
     state: &mut SendState,
     opts: &PushOptions,
     totals: Totals,
 ) -> Result<Option<Done>> {
     match message {
-        ServerMessage::Progress(progress) => {
+        IncomingServer::Progress(progress) => {
             state.remote_received = progress.received_bytes;
             state.remote_written = progress.written_bytes;
             state.remote_elapsed_millis = progress.elapsed_millis;
             publish_push_progress(opts, state, totals);
             Ok(None)
         }
-        ServerMessage::Done(done) => Ok(Some(done)),
-        ServerMessage::Error(err) => bail!("server error: {}", err.message),
-        ServerMessage::Hello(_) => bail!("unexpected server hello"),
+        IncomingServer::Done(done) => Ok(Some(done)),
+        IncomingServer::Error(err) => bail!("server error: {}", err.message),
+        IncomingServer::Hello(_) => bail!("unexpected server hello"),
+        IncomingServer::ProfileChanged { .. } => Ok(None),
     }
-}
-
-fn drain_server_messages(
-    rx: &mut mpsc::UnboundedReceiver<Result<ServerMessage, cftp_proto::ProtoError>>,
-    state: &mut SendState,
-    opts: &PushOptions,
-    totals: Totals,
-) -> Result<()> {
-    while let Ok(message) = rx.try_recv() {
-        match message {
-            Ok(message) => {
-                if apply_server_message(message, state, opts, totals)?.is_some() {
-                    bail!("server completed before receiving data");
-                }
-            }
-            Err(err) => return Err(err).context("control stream failed"),
-        }
-    }
-    Ok(())
 }
 
 struct BuiltPack {
@@ -333,23 +586,20 @@ enum EncodedItem {
 
 async fn produce_items(
     scan: scan::ScanResult,
-    opts: PushOptions,
+    controller: Arc<TuningController>,
     tx: mpsc::Sender<Result<EncodedItem>>,
 ) {
-    if let Err(err) = produce_items_inner(scan, opts, &tx).await {
+    if let Err(err) = produce_items_inner(scan, controller, &tx).await {
         let _ = tx.send(Err(err)).await;
     }
 }
 
 async fn produce_items_inner(
     scan: scan::ScanResult,
-    opts: PushOptions,
+    controller: Arc<TuningController>,
     tx: &mpsc::Sender<Result<EncodedItem>>,
 ) -> Result<()> {
-    let parallelism = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1);
-    let permits = Arc::new(Semaphore::new(parallelism));
+    let permits = controller.permits().clone();
     let mut tasks = tokio::task::JoinSet::new();
     let mut pack_entries = Vec::new();
     let mut pack_bytes = 0u64;
@@ -360,16 +610,20 @@ async fn produce_items_inner(
         .iter()
         .filter(|entry| entry.kind == EntryKind::File)
     {
-        if entry.size <= opts.small_file_max {
+        let tuning = controller.snapshot();
+        if entry.size <= tuning.small_file_max {
             pack_bytes = pack_bytes.saturating_add(entry.size);
             pack_entries.push(entry.clone());
-            if pack_bytes >= opts.pack_target as u64 || pack_entries.len() >= opts.pack_max_files {
+            if pack_bytes >= tuning.pack_target as u64
+                || pack_entries.len() >= tuning.pack_max_files
+            {
                 enqueue_pack(
                     &mut tasks,
                     &permits,
                     &scan.base,
                     &mut pack_entries,
                     &mut pack_id,
+                    tuning.pack_zstd_level,
                     tx,
                 )
                 .await?;
@@ -383,23 +637,26 @@ async fn produce_items_inner(
                     &scan.base,
                     &mut pack_entries,
                     &mut pack_id,
+                    tuning.pack_zstd_level,
                     tx,
                 )
                 .await?;
                 pack_bytes = 0;
             }
-            enqueue_large(&mut tasks, &permits, &scan.base, entry, &opts, tx).await?;
+            enqueue_large(&mut tasks, &permits, &scan.base, entry, &controller, tx).await?;
         }
         drain_encoding_tasks(&mut tasks)?;
     }
 
     if !pack_entries.is_empty() {
+        let tuning = controller.snapshot();
         enqueue_pack(
             &mut tasks,
             &permits,
             &scan.base,
             &mut pack_entries,
             &mut pack_id,
+            tuning.pack_zstd_level,
             tx,
         )
         .await?;
@@ -424,24 +681,27 @@ async fn enqueue_pack(
     base: &Path,
     entries: &mut Vec<ManifestEntry>,
     pack_id: &mut u64,
+    pack_level: i32,
     tx: &mpsc::Sender<Result<EncodedItem>>,
 ) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
-    let entries = std::mem::take(entries);
-    let base = base.to_path_buf();
-    let id = *pack_id;
+    let entries: Vec<ManifestEntry> = std::mem::take(entries);
+    let base: PathBuf = base.to_path_buf();
+    let id: u64 = *pack_id;
     *pack_id += 1;
-    let permit = permits
+    let permit: tokio::sync::OwnedSemaphorePermit = permits
         .clone()
         .acquire_owned()
         .await
         .context("encoding semaphore closed")?;
-    let tx = tx.clone();
+    let tx: mpsc::Sender<Result<EncodedItem>> = tx.clone();
     tasks.spawn(async move {
-        let _permit = permit;
-        let built = tokio::task::spawn_blocking(move || build_pack(base, entries, id)).await??;
+        let _permit: tokio::sync::OwnedSemaphorePermit = permit;
+        let built: BuiltPack =
+            tokio::task::spawn_blocking(move || build_pack(base, entries, id, pack_level))
+                .await??;
         tx.send(Ok(EncodedItem::Pack {
             header: built.header,
             payload: built.payload,
@@ -455,15 +715,20 @@ async fn enqueue_pack(
     Ok(())
 }
 
-fn build_pack(base: PathBuf, entries: Vec<ManifestEntry>, pack_id: u64) -> Result<BuiltPack> {
-    let mut pack_entries = Vec::with_capacity(entries.len());
-    let mut payload = Vec::new();
-    let mut compressible = false;
-    let mut logical_bytes = 0u64;
+fn build_pack(
+    base: PathBuf,
+    entries: Vec<ManifestEntry>,
+    pack_id: u64,
+    pack_level: i32,
+) -> Result<BuiltPack> {
+    let mut pack_entries: Vec<PackEntry> = Vec::with_capacity(entries.len());
+    let mut payload: Vec<u8> = Vec::new();
+    let mut compressible: bool = false;
+    let mut logical_bytes: u64 = 0u64;
 
     for entry in &entries {
-        let full_path = base.join(Path::new(&entry.path));
-        let data = fs::read(&full_path)
+        let full_path: PathBuf = base.join(Path::new(&entry.path));
+        let data: Vec<u8> = fs::read(&full_path)
             .with_context(|| format!("failed to read {}", full_path.display()))?;
         if data.len() as u64 != entry.size {
             bail!("{} changed while scanning", full_path.display());
@@ -478,12 +743,12 @@ fn build_pack(base: PathBuf, entries: Vec<ManifestEntry>, pack_id: u64) -> Resul
         payload.extend_from_slice(&data);
     }
 
-    let (chunk_codec, encoded) = if compressible {
-        codec::compress(&payload, PACK_LEVEL, true)?
+    let (chunk_codec, encoded): (Codec, Vec<u8>) = if compressible {
+        codec::compress(&payload, pack_level, true)?
     } else {
         (Codec::Raw, payload)
     };
-    let header = PackHeader {
+    let header: PackHeader = PackHeader {
         pack_id,
         codec: chunk_codec,
         uncompressed_len: logical_bytes,
@@ -504,49 +769,56 @@ async fn enqueue_large(
     permits: &Arc<Semaphore>,
     base: &Path,
     entry: &ManifestEntry,
-    opts: &PushOptions,
+    controller: &Arc<TuningController>,
     tx: &mpsc::Sender<Result<EncodedItem>>,
 ) -> Result<()> {
     let full_path = base.join(Path::new(&entry.path));
-    let mut file = tokio::fs::File::open(&full_path)
+    let mut file: tokio::fs::File = tokio::fs::File::open(&full_path)
         .await
         .with_context(|| format!("failed to open {}", full_path.display()))?;
-    let mut buffer = vec![0u8; opts.chunk_size.max(1)];
-    let mut offset = 0u64;
-    let allow_skip = !codec::extension_is_incompressible(&entry.path);
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut offset: u64 = 0u64;
+    let allow_skip: bool = !codec::extension_is_incompressible(&entry.path);
 
     loop {
-        let permit = permits
+        let tuning: Tuning = controller.snapshot();
+        let chunk_size: usize = tuning.chunk_size.max(1);
+        if buffer.len() != chunk_size {
+            buffer.resize(chunk_size, 0);
+        }
+        let chunk_level: i32 = tuning.chunk_zstd_level;
+        let permit: tokio::sync::OwnedSemaphorePermit = permits
             .clone()
             .acquire_owned()
             .await
             .context("encoding semaphore closed")?;
-        let read = file
-            .read(&mut buffer)
+        let read: usize = file
+            .read(&mut buffer[..chunk_size])
             .await
             .with_context(|| format!("failed to read {}", full_path.display()))?;
         if read == 0 {
             break;
         }
-        let data = buffer[..read].to_vec();
-        let done = offset + read as u64 == entry.size;
-        let file_id = entry.id;
-        let tx = tx.clone();
-        let chunk_offset = offset;
-        let chunk_len = read;
+        let data: Vec<u8> = buffer[..read].to_vec();
+        let done: bool = offset + read as u64 == entry.size;
+        let file_id: u64 = entry.id;
+        let tx: mpsc::Sender<Result<EncodedItem>> = tx.clone();
+        let chunk_offset: u64 = offset;
+        let chunk_len: usize = read;
         tasks.spawn(async move {
             let _permit = permit;
-            let (hash, chunk_codec, encoded) = tokio::task::spawn_blocking(move || {
-                let hash = codec::hash(&data);
-                let (chunk_codec, encoded) = if allow_skip {
-                    codec::compress(&data, CHUNK_LEVEL, true)?
-                } else {
-                    (Codec::Raw, data)
-                };
-                Ok::<_, anyhow::Error>((hash, chunk_codec, encoded))
-            })
-            .await??;
-            let header = ChunkHeader {
+            let (hash, chunk_codec, encoded): ([u8; 32], Codec, Vec<u8>) =
+                tokio::task::spawn_blocking(move || {
+                    let hash = codec::hash(&data);
+                    let (chunk_codec, encoded) = if allow_skip {
+                        codec::compress(&data, chunk_level, true)?
+                    } else {
+                        (Codec::Raw, data)
+                    };
+                    Ok::<_, anyhow::Error>((hash, chunk_codec, encoded))
+                })
+                .await??;
+            let header: ChunkHeader = ChunkHeader {
                 file_id,
                 offset: chunk_offset,
                 uncompressed_len: chunk_len as u32,
@@ -679,6 +951,8 @@ pub struct ServeOptions {
     pub listen: SocketAddr,
     pub progress: Option<ProgressSender>,
     pub on_ready: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
+    pub max_profile: HardwareProfile,
+    pub force_v2: bool,
 }
 
 impl ServeOptions {
@@ -688,6 +962,8 @@ impl ServeOptions {
             listen,
             progress: None,
             on_ready: None,
+            max_profile: HardwareProfile::Default,
+            force_v2: false,
         }
     }
 }
@@ -697,41 +973,55 @@ pub struct ServeStats {
     pub files: u64,
     pub bytes: u64,
     pub peer: Option<SocketAddr>,
+    pub effective_profile: HardwareProfile,
 }
 
 pub async fn serve_once(auth: &ServerAuth, opts: ServeOptions) -> Result<ServeStats> {
-    let root = opts.root.clone();
-    let meta = fs::metadata(&root)
+    let root: PathBuf = opts.root.clone();
+    let meta: fs::Metadata = fs::metadata(&root)
         .with_context(|| format!("failed to inspect root {}", root.display()))?;
     if !meta.is_dir() {
         bail!("root is not a directory: {}", root.display());
     }
 
-    let endpoint = Endpoint::server(auth.server_config()?, opts.listen)?;
-    let local_addr = endpoint.local_addr()?;
+    let current_profile: HardwareProfile = opts.max_profile.min(HardwareProfile::Default);
+    let initial_tuning: Tuning = Tuning::for_profile(current_profile, None);
+    let endpoint: Endpoint = Endpoint::server(
+        auth.server_config(&initial_tuning, opts.force_v2)?,
+        opts.listen,
+    )?;
+    let local_addr: SocketAddr = endpoint.local_addr()?;
     if let Some(on_ready) = opts.on_ready {
         let _ = on_ready.send(local_addr);
     }
-    let incoming = endpoint
+    let incoming: quinn::Incoming = endpoint
         .accept()
         .await
         .context("listener closed before a client connected")?;
-    let connection = incoming.await.context("failed to establish connection")?;
-    let peer = connection.remote_address();
+    let connection: Connection = incoming.await.context("failed to establish connection")?;
+    let peer: SocketAddr = connection.remote_address();
+    let wire: WireVersion = if opts.force_v2 {
+        WireVersion::V2
+    } else {
+        negotiated_version(&connection)
+    };
 
-    let (control_send, control_recv) = connection
+    let (control_send, control_recv): (SendStream, RecvStream) = connection
         .accept_bi()
         .await
         .context("client did not open a control stream")?;
 
-    let connection_for_error = connection.clone();
-    let result = receive_connection(
+    let connection_for_error: Connection = connection.clone();
+    let result: Result<ServeStats> = receive_connection(
         connection,
         control_send,
         control_recv,
         root,
         opts.progress,
         peer,
+        wire,
+        opts.max_profile,
+        current_profile,
     )
     .await;
 
@@ -744,6 +1034,7 @@ pub async fn serve_once(auth: &ServerAuth, opts: ServeOptions) -> Result<ServeSt
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_connection(
     connection: Connection,
     mut control_send: SendStream,
@@ -751,69 +1042,89 @@ async fn receive_connection(
     root: PathBuf,
     progress: Option<ProgressSender>,
     peer: SocketAddr,
+    wire: WireVersion,
+    max_profile: HardwareProfile,
+    initial_profile: HardwareProfile,
 ) -> Result<ServeStats> {
-    let first: ClientMessage = cftp_proto::read_frame(&mut control_recv)
-        .await
-        .context("failed to read client hello")?;
-
-    let hello = match first {
-        ClientMessage::Hello(hello) => hello,
-        ClientMessage::Abort(abort) => bail!("client aborted: {}", abort.message),
-        ClientMessage::Complete(_) => bail!("client completed before sending a manifest"),
+    let hello: HelloInfo = match read_client_hello(&mut control_recv, wire).await {
+        Ok(hello) => hello,
+        Err(err) => {
+            let _ = write_server_error(
+                &mut control_send,
+                wire,
+                Abort {
+                    message: err.to_string(),
+                },
+            )
+            .await;
+            let _ = control_send.finish();
+            return Err(err);
+        }
     };
 
-    if hello.version != PROTOCOL_VERSION {
-        let message = format!(
-            "protocol version mismatch: client {}, server {}",
-            hello.version, PROTOCOL_VERSION
-        );
-        let _ = cftp_proto::write_frame(
-            &mut control_send,
-            &ServerMessage::Hello(ServerHello {
-                version: PROTOCOL_VERSION,
-                accepted: false,
-                message: message.clone(),
-            }),
-        )
-        .await;
-        let _ = control_send.finish();
-        bail!("{message}");
-    }
-
     if hello.mode != TransferMode::Push {
-        let err = anyhow::anyhow!("unsupported transfer mode");
-        send_server_error(&mut control_send, &err).await;
+        let err: anyhow::Error = anyhow::anyhow!("unsupported transfer mode");
+        send_server_error(&mut control_send, wire, &err).await;
         return Err(err);
     }
 
-    let destination = match path::validate_destination(&hello.destination) {
+    let mut current_profile: HardwareProfile = initial_profile;
+    let mut effective_profile: HardwareProfile = HardwareProfile::Default;
+    let mut profile_accepted: bool = true;
+    let mut profile_message: String = String::new();
+    if wire == WireVersion::V3 {
+        if hello.profile <= max_profile {
+            current_profile = hello.profile;
+            effective_profile = hello.profile;
+        } else {
+            effective_profile = current_profile;
+            profile_accepted = false;
+            profile_message = format!(
+                "requested profile {} exceeds server cap {}",
+                hello.profile, max_profile
+            );
+        }
+    }
+    let mut server_tuning: Tuning = Tuning::for_profile(effective_profile, None);
+    apply_connection_tuning(&connection, &server_tuning);
+    let profile_notice: String = format!(
+        "profile: requested {}, server cap {}, effective {}",
+        hello.profile, max_profile, effective_profile
+    );
+    if let Some(progress) = &progress {
+        let _ = progress.send(ProgressEvent::Notice(profile_notice));
+    } else {
+        tracing::info!("{profile_notice}");
+    }
+
+    let destination: PathBuf = match path::validate_destination(&hello.destination) {
         Ok(destination) => destination,
         Err(err) => {
-            send_server_error(&mut control_send, &err).await;
+            send_server_error(&mut control_send, wire, &err).await;
             return Err(err);
         }
     };
 
-    let entries = match validate_manifest(&hello.entries) {
+    let entries: HashMap<u64, ManifestEntry> = match validate_manifest(&hello.entries) {
         Ok(entries) => entries,
         Err(err) => {
-            send_server_error(&mut control_send, &err).await;
+            send_server_error(&mut control_send, wire, &err).await;
             return Err(err);
         }
     };
-    let mut rel_paths = HashMap::new();
+    let mut rel_paths: HashMap<u64, PathBuf> = HashMap::new();
     for entry in entries.values() {
-        let relative = match path::validate_relative(&entry.path) {
+        let relative: PathBuf = match path::validate_relative(&entry.path) {
             Ok(relative) => relative,
             Err(err) => {
-                send_server_error(&mut control_send, &err).await;
+                send_server_error(&mut control_send, wire, &err).await;
                 return Err(err);
             }
         };
         rel_paths.insert(entry.id, destination.join(relative));
     }
 
-    let total_files = entries
+    let total_files: u64 = entries
         .values()
         .filter(|entry| entry.kind == EntryKind::File)
         .count() as u64;
@@ -824,53 +1135,77 @@ async fn receive_connection(
         .sum();
 
     if let Err(err) = create_manifest_entries(&root, &destination, &entries, &rel_paths) {
-        send_server_error(&mut control_send, &err).await;
+        send_server_error(&mut control_send, wire, &err).await;
         return Err(err);
     }
 
-    cftp_proto::write_frame(
+    write_server_hello(
         &mut control_send,
-        &ServerMessage::Hello(ServerHello {
-            version: PROTOCOL_VERSION,
+        wire,
+        &ServerHelloInfo {
+            version: if wire == WireVersion::V3 {
+                cftp_proto::PROTOCOL_VERSION_V3
+            } else {
+                cftp_proto::PROTOCOL_VERSION_V2
+            },
             accepted: true,
             message: "ready".to_string(),
-        }),
+            effective_profile,
+            server_cap: if wire == WireVersion::V3 {
+                max_profile
+            } else {
+                HardwareProfile::Default
+            },
+            profile_accepted,
+        },
     )
     .await?;
+    if !profile_message.is_empty() {
+        tracing::debug!("{profile_message}");
+    }
 
-    let state = Arc::new(tokio::sync::Mutex::new(ReceiverState {
-        root,
-        entries,
-        rel_paths,
-        ranges: HashMap::new(),
-        completed: HashSet::new(),
-        pending: HashMap::new(),
-        total_files,
-        total_bytes,
-        files_done: 0,
-        bytes_done: 0,
-        wire_received: 0,
-        written_bytes: 0,
-        started: Instant::now(),
-        progress,
-    }));
-    let mut last_progress = Instant::now();
+    let state: Arc<tokio::sync::Mutex<ReceiverState>> =
+        Arc::new(tokio::sync::Mutex::new(ReceiverState {
+            root,
+            entries,
+            rel_paths,
+            ranges: HashMap::new(),
+            completed: HashSet::new(),
+            pending: HashMap::new(),
+            total_files,
+            total_bytes,
+            files_done: 0,
+            bytes_done: 0,
+            wire_received: 0,
+            written_bytes: 0,
+            started: Instant::now(),
+            progress,
+        }));
+    let mut last_progress: Instant = Instant::now();
 
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let control_task = tokio::spawn(async move {
-        while let Ok(message) = cftp_proto::read_frame::<_, ClientMessage>(&mut control_recv).await
-        {
-            if control_tx.send(message).is_err() {
-                break;
+    let (control_tx, mut control_rx): (ClientMessageSender, ClientMessageReceiver) =
+        mpsc::unbounded_channel();
+    let control_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+        loop {
+            match read_client_message(&mut control_recv, wire).await {
+                Ok(message) => {
+                    if control_tx.send(Ok(message)).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = control_tx.send(Err(err));
+                    break;
+                }
             }
         }
     });
 
-    let mut complete = false;
-    let mut streams = tokio::task::JoinSet::new();
-    let result = loop {
+    let mut complete: bool = false;
+    let mut streams: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+    let result: Result<()> = loop {
         if complete && streams.is_empty() {
-            let all_complete = { state.lock().await.all_complete() };
+            let all_complete: bool = { state.lock().await.all_complete() };
             if all_complete {
                 break Ok(());
             }
@@ -891,14 +1226,50 @@ async fn receive_connection(
         tokio::select! {
             message = control_rx.recv() => {
                 match message {
-                    Some(ClientMessage::Complete(_)) => {
+                    Some(Ok(IncomingClient::Complete(_))) => {
                         complete = true;
                     }
-                    Some(ClientMessage::Abort(abort)) => {
+                    Some(Ok(IncomingClient::Abort(abort))) => {
                         break Err(anyhow::anyhow!("client aborted: {}", abort.message));
                     }
-                    Some(ClientMessage::Hello(_)) => {
+                    Some(Ok(IncomingClient::SetProfile { request_id, profile })) => {
+                        if wire == WireVersion::V3 {
+                            if profile <= max_profile {
+                                current_profile = profile;
+                                effective_profile = profile;
+                                server_tuning = Tuning::for_profile(effective_profile, None);
+                                apply_connection_tuning(&connection, &server_tuning);
+                                write_profile_changed(
+                                    &mut control_send,
+                                    request_id,
+                                    true,
+                                    effective_profile,
+                                    max_profile,
+                                    String::new(),
+                                )
+                                .await?;
+                            } else {
+                                effective_profile = current_profile;
+                                write_profile_changed(
+                                    &mut control_send,
+                                    request_id,
+                                    false,
+                                    effective_profile,
+                                    max_profile,
+                                    format!(
+                                        "requested profile {} exceeds server cap {}",
+                                        profile, max_profile
+                                    ),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    Some(Ok(IncomingClient::Hello(_))) => {
                         break Err(anyhow::anyhow!("client sent a second hello"));
+                    }
+                    Some(Err(err)) => {
+                        break Err(err).context("control stream failed");
                     }
                     None => {
                         break Err(anyhow::anyhow!("control stream closed before completion"));
@@ -909,7 +1280,7 @@ async fn receive_connection(
                 match result {
                     Some(Ok(Ok(()))) => {
                         if let Err(err) =
-                            maybe_send_progress(&mut control_send, &state, &mut last_progress).await
+                            maybe_send_progress(&mut control_send, wire, &state, &mut last_progress).await
                         {
                             break Err(err);
                         }
@@ -923,7 +1294,7 @@ async fn receive_connection(
                     None => {}
                 }
             }
-            stream = connection.accept_uni(), if streams.len() < MAX_INFLIGHT_STREAMS => {
+            stream = connection.accept_uni(), if streams.len() < server_tuning.max_inflight_streams => {
                 match stream {
                     Ok(stream) => {
                         spawn_receive_task(&mut streams, state.clone(), stream);
@@ -939,11 +1310,11 @@ async fn receive_connection(
 
     if let Err(err) = result {
         streams.abort_all();
-        send_server_error(&mut control_send, &err).await;
+        send_server_error(&mut control_send, wire, &err).await;
         return Err(err);
     }
 
-    let (done, server_progress) = {
+    let (done, server_progress): (Done, ServerProgress) = {
         let state = state.lock().await;
         (
             Done {
@@ -953,8 +1324,8 @@ async fn receive_connection(
             state.server_progress(),
         )
     };
-    cftp_proto::write_frame(&mut control_send, &ServerMessage::Progress(server_progress)).await?;
-    cftp_proto::write_frame(&mut control_send, &ServerMessage::Done(done.clone())).await?;
+    write_server_progress(&mut control_send, wire, server_progress).await?;
+    write_server_done(&mut control_send, wire, done.clone()).await?;
     control_send.finish()?;
     // Keep the connection alive long enough for the client to read the final
     // message. Dropping the last local handle closes the connection.
@@ -973,15 +1344,17 @@ async fn receive_connection(
         files: done.files,
         bytes: done.bytes,
         peer: Some(peer),
+        effective_profile,
     })
 }
 
-async fn send_server_error(control_send: &mut SendStream, err: &anyhow::Error) {
-    let _ = cftp_proto::write_frame(
+async fn send_server_error(control_send: &mut SendStream, wire: WireVersion, err: &anyhow::Error) {
+    let _ = write_server_error(
         control_send,
-        &ServerMessage::Error(Abort {
+        wire,
+        Abort {
             message: err.to_string(),
-        }),
+        },
     )
     .await;
     let _ = control_send.finish();
@@ -1020,6 +1393,7 @@ fn create_manifest_entries(
 
 async fn maybe_send_progress(
     control_send: &mut SendStream,
+    wire: WireVersion,
     state: &Arc<tokio::sync::Mutex<ReceiverState>>,
     last: &mut Instant,
 ) -> Result<()> {
@@ -1028,7 +1402,7 @@ async fn maybe_send_progress(
     }
     *last = Instant::now();
     let progress = { state.lock().await.server_progress() };
-    cftp_proto::write_frame(control_send, &ServerMessage::Progress(progress)).await?;
+    write_server_progress(control_send, wire, progress).await?;
     Ok(())
 }
 

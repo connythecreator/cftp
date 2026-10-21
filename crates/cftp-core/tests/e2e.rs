@@ -57,6 +57,8 @@ async fn transfers_a_tree_over_mutual_tls() {
         listen: "127.0.0.1:0".parse().unwrap(),
         progress: None,
         on_ready: Some(ready_tx),
+        max_profile: cftp_core::tuning::HardwareProfile::Default,
+        force_v2: false,
     };
     let server_identity = ServerAuth::Cert(server_identity);
     let server = tokio::spawn(async move { serve_once(&server_identity, server_opts).await });
@@ -260,6 +262,8 @@ async fn rejects_invalid_destination_without_hanging() {
                 listen: "127.0.0.1:0".parse().unwrap(),
                 progress: None,
                 on_ready: Some(ready_tx),
+                max_profile: cftp_core::tuning::HardwareProfile::Default,
+                force_v2: false,
             },
         )
         .await
@@ -371,6 +375,8 @@ async fn transfers_a_tree_over_ssh_keys() {
                 listen: "127.0.0.1:0".parse().unwrap(),
                 progress: None,
                 on_ready: Some(ready_tx),
+                max_profile: cftp_core::tuning::HardwareProfile::Default,
+                force_v2: false,
             },
         )
         .await
@@ -414,4 +420,165 @@ async fn transfers_a_tree_over_ssh_keys() {
         fs::read(dest.join("project/src/main.js")).unwrap(),
         b"console.log('ssh')\n"
     );
+}
+
+async fn run_profile_transfer(
+    requested: cftp_core::tuning::HardwareProfile,
+    server_cap: cftp_core::tuning::HardwareProfile,
+    force_v2: bool,
+    hotkeys: Option<tokio::sync::watch::Receiver<cftp_core::tuning::HardwareProfile>>,
+    size: usize,
+) -> (cftp_core::transfer::PushStats, Vec<u8>) {
+    use cftp_core::auth::{HostKeyPolicy, SshClientAuth, SshServerAuth};
+    use cftp_core::ssh::{SshPublicKey, from_private_key};
+    use cftp_core::trust::AuthorizedKeys;
+    use cftp_core::tuning::Tuning;
+    use ssh_key::rand_core::OsRng;
+
+    let temp = tempfile::tempdir().unwrap();
+    let server_private =
+        ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let client_private =
+        ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let client_public = SshPublicKey::from_ssh(client_private.public_key().clone()).unwrap();
+    let authorized_keys_path = temp.path().join("authorized_keys");
+    fs::write(
+        &authorized_keys_path,
+        format!("{}\n", client_public.public_openssh().unwrap()),
+    )
+    .unwrap();
+
+    let server_auth = ServerAuth::Ssh(SshServerAuth::new(
+        from_private_key(server_private).unwrap(),
+        AuthorizedKeys::load(&authorized_keys_path).unwrap(),
+    ));
+    let client_auth = ClientAuth::Ssh(SshClientAuth::new(
+        from_private_key(client_private).unwrap(),
+        cftp_core::trust::KnownHostsStore::load(temp.path().join("known_hosts")).unwrap(),
+        "127.0.0.1",
+        4433,
+        HostKeyPolicy::AcceptNew,
+    ));
+
+    let project = temp.path().join("src/project");
+    fs::create_dir_all(&project).unwrap();
+    let payload = vec![0x5a; size];
+    fs::write(project.join("large.bin"), &payload).unwrap();
+
+    let dest = temp.path().join("dst");
+    fs::create_dir_all(&dest).unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let server_dest = dest.clone();
+    let server = tokio::spawn(async move {
+        serve_once(
+            &server_auth,
+            ServeOptions {
+                root: server_dest,
+                listen: "127.0.0.1:0".parse().unwrap(),
+                progress: None,
+                on_ready: Some(ready_tx),
+                max_profile: server_cap,
+                force_v2,
+            },
+        )
+        .await
+    });
+    let addr = ready_rx.await.unwrap();
+
+    let stats = push(
+        &project,
+        addr,
+        &client_auth,
+        PushOptions {
+            server_name: DEFAULT_SERVER_NAME.to_string(),
+            profile: requested,
+            tuning: Tuning::for_profile(requested, None),
+            force_v2,
+            profile_requests: hotkeys,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    server.await.unwrap().unwrap();
+
+    let received = fs::read(dest.join("project/large.bin")).unwrap();
+    assert_eq!(received, payload);
+    (stats, received)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn profiles_negotiate_and_server_caps_requests() {
+    use cftp_core::tuning::HardwareProfile;
+
+    let (stats, _) = run_profile_transfer(
+        HardwareProfile::Light,
+        HardwareProfile::Default,
+        false,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    assert_eq!(stats.effective_profile, HardwareProfile::Light);
+
+    let (stats, _) = run_profile_transfer(
+        HardwareProfile::Aggressive,
+        HardwareProfile::Default,
+        false,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    assert_eq!(stats.effective_profile, HardwareProfile::Default);
+
+    let (stats, _) = run_profile_transfer(
+        HardwareProfile::Aggressive,
+        HardwareProfile::Aggressive,
+        false,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    assert_eq!(stats.effective_profile, HardwareProfile::Aggressive);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forced_v2_ignores_profiles() {
+    use cftp_core::tuning::HardwareProfile;
+
+    let (stats, _) = run_profile_transfer(
+        HardwareProfile::Aggressive,
+        HardwareProfile::Default,
+        true,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    assert_eq!(stats.effective_profile, HardwareProfile::Default);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hotswaps_profile_during_transfer() {
+    use cftp_core::tuning::HardwareProfile;
+
+    let (tx, rx) = tokio::sync::watch::channel(HardwareProfile::Light);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = tx.send(HardwareProfile::Aggressive);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = tx.send(HardwareProfile::Light);
+    });
+
+    let (stats, _) = run_profile_transfer(
+        HardwareProfile::Light,
+        HardwareProfile::Aggressive,
+        false,
+        Some(rx),
+        32 * 1024 * 1024,
+    )
+    .await;
+    assert!(matches!(
+        stats.effective_profile,
+        HardwareProfile::Light | HardwareProfile::Aggressive
+    ));
 }

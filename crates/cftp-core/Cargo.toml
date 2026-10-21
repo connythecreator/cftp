@@ -16,6 +16,7 @@ ed25519-dalek.workspace = true
 filetime.workspace = true
 hex.workspace = true
 hmac.workspace = true
+netdev.workspace = true
 p256.workspace = true
 p384.workspace = true
 postcard.workspace = true

@@ -1,8 +1,8 @@
 # Maintainer: Conleth <103609099@student.swin.edu.au>
 pkgname=cftp
-pkgver=0.1.1
+pkgver=0.2.0
 pkgrel=1
-pkgdesc='QUIC-based file transfer with zstd compression and mutual TLS'
+pkgdesc='QUIC-based file transfer with SSH-key authentication and optional mutual TLS'
 arch=('x86_64')
 url='https://github.com/connythecreator/cftp'
 license=('GPL-3.0-only')

@@ -12,7 +12,7 @@ cftp is split into three crates:
 1. The client scans the source, assigns each entry an id, and sends a
    `ClientHello` manifest over a bidirectional control stream.
 2. The server validates the destination, manifest paths, ids, and symlink
-   targets, then replies with `ServerHello`.
+   targets, negotiates the hardware profile, then replies with `ServerHello`.
 3. Data travels on many unidirectional streams. Each stream begins with a
    `DataHeader` frame and is followed by raw payload bytes.
 4. The server sends periodic `Progress` messages with receive and write
@@ -23,10 +23,33 @@ cftp is split into three crates:
 
 ## Wire format
 
-- ALPN is `cftp/2`; `PROTOCOL_VERSION` is `2`.
+- ALPN is `cftp/3` with `cftp/2` fallback. `PROTOCOL_VERSION_V3` is `3`;
+  `PROTOCOL_VERSION_V2` is `2`.
+- New peers advertise both ALPNs and select `cftp/3` when both support it.
+  Old peers continue to use the unchanged `cftp/2` messages.
+- `cftp/3` adds `HardwareProfile` to `ClientHello` and effective/cap profiles to
+  `ServerHello`, plus `SetProfile` and `ProfileChanged` control messages.
 - Control messages are a 4-byte big-endian length followed by a postcard payload.
 - `MAX_CONTROL_FRAME` is 256 MiB and `MAX_DATA_PAYLOAD` is 64 MiB.
 - Data payloads are not length-framed; their lengths come from the data header.
+
+## Hardware profiles and hotswapping
+
+- `light`, `default`, and `aggressive` presets control worker threads, chunk
+  and pack sizes, zstd levels, in-flight work, stream limits, and QUIC windows.
+- The client requests a profile. The server has a fixed cap configured at
+  startup and may accept or reject each request. Rejections leave the current
+  profile unchanged and do not abort the transfer.
+- The server never changes its profile spontaneously; only accepted client
+  requests change it.
+- During `put`, `l`, `d`, and `a` hotkeys send a new request. The client applies
+  the server-reported effective profile.
+- Only the client adjusts tuning automatically. Aggressive mode adapts zstd
+  levels from adapter link speed, measured throughput, RTT, and loss, with
+  hysteresis and a cooldown. It never sends automatic profile changes.
+- On `cftp/2`, profile flags and hotkeys are ignored.
+- Quinn supports changing send/receive windows and stream limits after the
+  handshake. `stream_receive_window` is fixed at connection setup.
 
 ## Packing and chunking
 
@@ -102,6 +125,10 @@ To report a vulnerability, see [the security policy](../.github/SECURITY.md).
 ## Known limitations
 
 - `serve` handles one connection per process.
+- `cftp/3` profiles require both peers to support `cftp/3`; `cftp/2` peers use
+  the legacy default tuning.
+- Aggressive mode can consume hundreds of MiB because it increases in-flight
+  data and QUIC windows.
 - Transfers are not resumed across sessions; interrupted transfers restart.
 - `ssh-agent` and SSH certificate authentication are not supported yet.
 - Filenames must be valid UTF-8. On Unix, filenames containing backslashes are

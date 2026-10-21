@@ -13,9 +13,11 @@ large files are split into chunks.
 
 ## Features
 
-- QUIC transport with ALPN `cftp/2`.
+- QUIC transport with ALPN `cftp/3` and automatic `cftp/2` fallback.
 - SSH-key authentication by default, using `authorized_keys` and `known_hosts`.
 - Optional mutual TLS with a local CA.
+- Light, default, and aggressive hardware profiles.
+- Live profile hotkeys during `put`, with server-side caps.
 - zstd compression, skipping known incompressible file extensions.
 - Small-file packs and offset-based chunks for large files.
 - BLAKE3 integrity checks for every pack entry and chunk.
@@ -103,6 +105,30 @@ fingerprint and asks you to confirm it, like `scp`. In scripts, pass
 The receiver writes the transfer under `./incoming/project/`. `serve` is
 one-shot: it accepts one connection, receives the transfer, then exits.
 
+During a remote `put`, press `l`, `d`, or `a` to switch between light, default,
+and aggressive profiles without restarting the transfer. The server may reject
+a request above its configured cap; the transfer continues at the current
+profile.
+
+### Hardware profiles
+
+| Profile | Intended use |
+| --- | --- |
+| `--light` | Minimal CPU, memory, and network usage. |
+| `--default` | The default tuning. |
+| `--aggressive` | Saturate CPU, memory, and network for the fastest transfer. |
+
+`serve` defaults to a `default` cap. Run `serve --aggressive` to allow clients
+to request aggressive mode; `serve --light` caps all clients at light.
+`--aggressive` uses the detected link speed and observed transfer throughput
+to choose zstd levels while the transfer runs.
+
+Profiles are mutually exclusive with `--chunk-size`, `--pack-target`,
+`--pack-max-files`, and `--small-file-max`.
+
+Older `cftp/2` peers still work. Profile flags and hotkeys are ignored on
+`cftp/2`.
+
 To copy locally instead of over the network:
 
 ```bash
@@ -155,6 +181,7 @@ On Linux the default directory is `~/.config/cftp`.
 | `--root <DIR>` | Required. Directory that received files are written under. |
 | `--listen <ADDR>` | UDP address to listen on. Defaults to `0.0.0.0:4433`. |
 | `--auth <auto\|ssh\|cert>` | Authentication backend. Defaults to `auto`. |
+| `--light` / `--default` / `--aggressive` | Maximum hardware profile accepted from clients. Defaults to `default`. |
 | `--host-key <FILE>` | SSH host key. Defaults to `~/.ssh/id_ed25519`. |
 | `--authorized-keys <FILE>` | SSH keys allowed to connect. Defaults to `~/.ssh/authorized_keys`. |
 | `--identity <FILE>` | Leaf certificate presented to clients (cert mode). |
@@ -169,6 +196,7 @@ On Linux the default directory is `~/.config/cftp`.
 | `<SRC>` | Source file or directory. |
 | `<DEST>` | A `cftp://host[:port]/path` URL, or a local destination directory. |
 | `--auth <auto\|ssh\|cert>` | Authentication backend. Defaults to `auto`. |
+| `--light` / `--default` / `--aggressive` | Requested hardware profile. Defaults to `default`. Hotkeys override it during the transfer. |
 | `--ssh-key <FILE>` | SSH private key presented to the server. Defaults to the first of `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`. |
 | `--known-hosts <FILE>` | Host keys used to verify the server. Defaults to `~/.ssh/known_hosts`. |
 | `--accept-new` | Add an unknown server host key to `known_hosts` without prompting. |

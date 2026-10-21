@@ -10,9 +10,10 @@ use rustls::{
     ClientConfig, DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme,
 };
 
-use crate::identity::{Identity, transport_config};
+use crate::identity::{Identity, alpn_protocols, transport_config};
 use crate::ssh::{SshPrivateKey, SshPublicKey};
 use crate::trust::{AuthorizedKeys, HostKeyStatus, KnownHostsStore, public_key_from_spki_checked};
+use crate::tuning::Tuning;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostKeyPolicy {
@@ -123,10 +124,10 @@ pub enum ServerAuth {
 }
 
 impl ServerAuth {
-    pub fn server_config(&self) -> Result<quinn::ServerConfig> {
+    pub fn server_config(&self, tuning: &Tuning, force_v2: bool) -> Result<quinn::ServerConfig> {
         match self {
-            Self::Cert(identity) => identity.server_config(),
-            Self::Ssh(auth) => ssh_server_config(auth),
+            Self::Cert(identity) => identity.server_config(tuning, force_v2),
+            Self::Ssh(auth) => ssh_server_config(auth, tuning, force_v2),
         }
     }
 }
@@ -137,10 +138,10 @@ pub enum ClientAuth {
 }
 
 impl ClientAuth {
-    pub fn client_config(&self) -> Result<quinn::ClientConfig> {
+    pub fn client_config(&self, tuning: &Tuning, force_v2: bool) -> Result<quinn::ClientConfig> {
         match self {
-            Self::Cert(identity) => identity.client_config(),
-            Self::Ssh(auth) => ssh_client_config(auth),
+            Self::Cert(identity) => identity.client_config(tuning, force_v2),
+            Self::Ssh(auth) => ssh_client_config(auth, tuning, force_v2),
         }
     }
 
@@ -153,8 +154,8 @@ impl ClientAuth {
 }
 
 fn raw_public_key(key: &SshPrivateKey) -> Result<Arc<CertifiedKey>> {
-    let provider = rustls::crypto::ring::default_provider();
-    let signing = provider
+    let provider: rustls::crypto::CryptoProvider = rustls::crypto::ring::default_provider();
+    let signing: Arc<dyn rustls::sign::SigningKey> = provider
         .key_provider
         .load_private_key(key.pkcs8())
         .context("failed to load SSH private key for TLS")?;
@@ -164,30 +165,41 @@ fn raw_public_key(key: &SshPrivateKey) -> Result<Arc<CertifiedKey>> {
     )))
 }
 
-fn ssh_server_config(auth: &SshServerAuth) -> Result<quinn::ServerConfig> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = Arc::new(SshClientCertVerifier {
+fn ssh_server_config(
+    auth: &SshServerAuth,
+    tuning: &Tuning,
+    force_v2: bool,
+) -> Result<quinn::ServerConfig> {
+    let provider: Arc<rustls::crypto::CryptoProvider> =
+        Arc::new(rustls::crypto::ring::default_provider());
+    let verifier: Arc<SshClientCertVerifier> = Arc::new(SshClientCertVerifier {
         authorized_keys: auth.authorized_keys.clone(),
         provider: provider.clone(),
     });
-    let certified = raw_public_key(&auth.host_key)?;
-    let mut config = ServerConfig::builder_with_provider(provider)
+    let certified: Arc<CertifiedKey> = raw_public_key(&auth.host_key)?;
+    let mut config: ServerConfig = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .with_client_cert_verifier(verifier)
         .with_cert_resolver(Arc::new(
             rustls::server::AlwaysResolvesServerRawPublicKeys::new(certified),
         ));
-    config.alpn_protocols = vec![cftp_proto::ALPN.to_vec()];
+    config.alpn_protocols = alpn_protocols(force_v2);
 
-    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(config)?;
-    let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic));
-    server.transport_config(Arc::new(transport_config()));
+    let quic: quinn::crypto::rustls::QuicServerConfig =
+        quinn::crypto::rustls::QuicServerConfig::try_from(config)?;
+    let mut server: quinn::ServerConfig = quinn::ServerConfig::with_crypto(Arc::new(quic));
+    server.transport_config(Arc::new(transport_config(tuning)));
     Ok(server)
 }
 
-fn ssh_client_config(auth: &SshClientAuth) -> Result<quinn::ClientConfig> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = Arc::new(SshServerCertVerifier {
+fn ssh_client_config(
+    auth: &SshClientAuth,
+    tuning: &Tuning,
+    force_v2: bool,
+) -> Result<quinn::ClientConfig> {
+    let provider: Arc<rustls::crypto::CryptoProvider> =
+        Arc::new(rustls::crypto::ring::default_provider());
+    let verifier: Arc<SshServerCertVerifier> = Arc::new(SshServerCertVerifier {
         known_hosts: auth.known_hosts.clone(),
         host: auth.host.clone(),
         port: auth.port,
@@ -195,19 +207,20 @@ fn ssh_client_config(auth: &SshClientAuth) -> Result<quinn::ClientConfig> {
         unknown: auth.unknown.clone(),
         provider: provider.clone(),
     });
-    let certified = raw_public_key(&auth.key)?;
-    let mut config = ClientConfig::builder_with_provider(provider)
+    let certified: Arc<CertifiedKey> = raw_public_key(&auth.key)?;
+    let mut config: ClientConfig = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_cert_resolver(Arc::new(
             rustls::client::AlwaysResolvesClientRawPublicKeys::new(certified),
         ));
-    config.alpn_protocols = vec![cftp_proto::ALPN.to_vec()];
+    config.alpn_protocols = alpn_protocols(force_v2);
 
-    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(config)?;
-    let mut client = quinn::ClientConfig::new(Arc::new(quic));
-    client.transport_config(Arc::new(transport_config()));
+    let quic: quinn::crypto::rustls::QuicClientConfig =
+        quinn::crypto::rustls::QuicClientConfig::try_from(config)?;
+    let mut client: quinn::ClientConfig = quinn::ClientConfig::new(Arc::new(quic));
+    client.transport_config(Arc::new(transport_config(tuning)));
     Ok(client)
 }
 
@@ -314,8 +327,8 @@ impl ServerCertVerifier for SshServerCertVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let spki = end_entity.as_ref();
-        let status = self
+        let spki: &[u8] = end_entity.as_ref();
+        let status: HostKeyStatus = self
             .known_hosts
             .lock()
             .expect("known hosts lock poisoned")
@@ -337,7 +350,7 @@ impl ServerCertVerifier for SshServerCertVerifier {
             ))),
             HostKeyStatus::Unknown => match self.policy {
                 HostKeyPolicy::AcceptNew => {
-                    let public = public_key_from_spki_checked(spki)
+                    let public: SshPublicKey = public_key_from_spki_checked(spki)
                         .map_err(|err| rustls::Error::General(err.to_string()))?;
                     self.known_hosts
                         .lock()
@@ -351,9 +364,9 @@ impl ServerCertVerifier for SshServerCertVerifier {
                     self.host, self.port
                 ))),
                 HostKeyPolicy::Ask => {
-                    let public = public_key_from_spki_checked(spki)
+                    let public: SshPublicKey = public_key_from_spki_checked(spki)
                         .map_err(|err| rustls::Error::General(err.to_string()))?;
-                    let fingerprint = public.fingerprint().to_string();
+                    let fingerprint: String = public.fingerprint().to_string();
                     *self.unknown.lock().expect("unknown host key lock poisoned") =
                         Some(UnknownHostKey {
                             host: self.host.clone(),
@@ -420,8 +433,8 @@ pub fn load_server_auth(
             host_key.display()
         );
     }
-    let key = crate::ssh::load_private_key(host_key, passphrase)?;
-    let authorized = AuthorizedKeys::load(authorized_keys)?;
+    let key: SshPrivateKey = crate::ssh::load_private_key(host_key, passphrase)?;
+    let authorized: AuthorizedKeys = AuthorizedKeys::load(authorized_keys)?;
     Ok(ServerAuth::Ssh(SshServerAuth::new(key, authorized)))
 }
 
@@ -433,7 +446,7 @@ pub fn load_client_auth(
     policy: HostKeyPolicy,
     passphrase: impl FnMut(&std::path::Path) -> Result<String>,
 ) -> Result<ClientAuth> {
-    let key = crate::ssh::load_private_key(key_path, passphrase)?;
+    let key: SshPrivateKey = crate::ssh::load_private_key(key_path, passphrase)?;
     Ok(ClientAuth::Ssh(SshClientAuth::new(
         key,
         known_hosts,

@@ -8,15 +8,17 @@ use anyhow::{Context, Result, bail};
 use cftp_cli::cli::{
     AuthMode, Cli, Command, IdentityCommand, IdentityInitArgs, PutArgs, ServeArgs,
 };
+use cftp_cli::hotkeys::Hotkeys;
 use cftp_core::auth::{
     ClientAuth, HostKeyPolicy, ServerAuth, SshClientAuth, SshServerAuth, UnknownHostKey,
 };
 use cftp_core::identity::{Identity, IdentityPaths, init_identity};
-use cftp_core::local::copy_local;
+use cftp_core::local::{LocalCopyStats, copy_local};
 use cftp_core::progress::{ProgressEvent, ProgressSender, TransferProgress};
 use cftp_core::ssh::{SshPaths, load_private_key};
-use cftp_core::transfer::{PushOptions, ServeOptions, push, serve_once};
+use cftp_core::transfer::{PushOptions, PushStats, ServeOptions, ServeStats, push, serve_once};
 use cftp_core::trust::{AuthorizedKeys, KnownHostsStore};
+use cftp_core::tuning::{HardwareProfile, Tuning};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::net::lookup_host;
@@ -32,7 +34,7 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let cli = Cli::parse();
+    let cli: Cli = Cli::parse();
     match cli.command {
         Command::Identity { command } => match command {
             IdentityCommand::Init(args) => init(args),
@@ -60,11 +62,11 @@ fn init(args: IdentityInitArgs) -> Result<()> {
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
-    let use_cert = matches!(args.auth, AuthMode::Cert)
+    let use_cert: bool = matches!(args.auth, AuthMode::Cert)
         || (matches!(args.auth, AuthMode::Auto)
             && (args.identity.is_some() || args.key.is_some() || args.client_ca.is_some()));
 
-    let auth = if use_cert {
+    let auth: ServerAuth = if use_cert {
         let defaults = IdentityPaths::user()?;
         let identity_path = args.identity.unwrap_or(defaults.cert);
         let key_path = args.key.unwrap_or(defaults.key);
@@ -101,24 +103,30 @@ async fn serve(args: ServeArgs) -> Result<()> {
         args.root.display()
     );
 
-    let (progress, progress_task) = progress_channel(args.quiet);
-    let options = ServeOptions {
+    let (progress, progress_task): (ProgressSender, tokio::task::JoinHandle<()>) =
+        progress_channel(args.quiet);
+    let max_profile: HardwareProfile = args.hardware.selected().unwrap_or(HardwareProfile::Default);
+    println!("hardware profile cap: {max_profile}");
+    let options: ServeOptions = ServeOptions {
         root: args.root,
         listen: args.listen,
         progress: Some(progress),
         on_ready: None,
+        max_profile,
+        force_v2: false,
     };
-    let result = serve_once(&auth, options).await;
+    let result: Result<ServeStats> = serve_once(&auth, options).await;
     let _ = progress_task.await;
-    let stats = result?;
+    let stats: ServeStats = result?;
     println!(
-        "received {} files, {} bytes from {}",
+        "received {} files, {} bytes from {} (profile {})",
         stats.files,
         stats.bytes,
         stats
             .peer
             .map(|peer| peer.to_string())
-            .unwrap_or_else(|| "unknown peer".to_string())
+            .unwrap_or_else(|| "unknown peer".to_string()),
+        stats.effective_profile
     );
     Ok(())
 }
@@ -126,10 +134,11 @@ async fn serve(args: ServeArgs) -> Result<()> {
 async fn put(args: PutArgs) -> Result<()> {
     match parse_destination(&args.dest)? {
         Destination::Local(destination) => {
-            let (progress, progress_task) = progress_channel(args.quiet);
+            let (progress, progress_task): (ProgressSender, tokio::task::JoinHandle<()>) =
+                progress_channel(args.quiet);
             let result = copy_local(&args.src, &destination, Some(progress)).await;
             let _ = progress_task.await;
-            let stats = result?;
+            let stats: LocalCopyStats = result?;
             println!(
                 "copied {} files, {} bytes to {}",
                 stats.files,
@@ -149,11 +158,11 @@ async fn put(args: PutArgs) -> Result<()> {
                 .next()
                 .with_context(|| format!("{host}:{port} did not resolve to an address"))?;
 
-            let use_cert = matches!(args.auth, AuthMode::Cert)
+            let use_cert: bool = matches!(args.auth, AuthMode::Cert)
                 || (matches!(args.auth, AuthMode::Auto)
                     && (args.identity.is_some() || args.key.is_some() || args.server_ca.is_some()));
 
-            let auth = if use_cert {
+            let auth: ClientAuth = if use_cert {
                 let defaults = IdentityPaths::user()?;
                 let identity_path = args.identity.unwrap_or(defaults.cert);
                 let key_path = args.key.unwrap_or(defaults.key);
@@ -188,22 +197,40 @@ async fn put(args: PutArgs) -> Result<()> {
                 ))
             };
 
-            let (progress, progress_task) = progress_channel(args.quiet);
-            let options = PushOptions {
+            let selected: Option<HardwareProfile> = args.hardware.selected();
+            let requested_profile: HardwareProfile = selected.unwrap_or(HardwareProfile::Default);
+            let tuning: Tuning = match selected {
+                Some(profile) => Tuning::for_profile(profile, None),
+                None => Tuning::default().with_overrides(
+                    args.chunk_size,
+                    args.pack_target,
+                    args.pack_max_files,
+                    args.small_file_max,
+                ),
+            };
+
+            let hotkeys: Option<Hotkeys> = Hotkeys::start(requested_profile, args.quiet)?;
+            if hotkeys.is_some() && !args.quiet {
+                eprintln!("profiles: [l]ight [d]efault [a]ggressive");
+            }
+            let (progress, progress_task): (ProgressSender, tokio::task::JoinHandle<()>) =
+                progress_channel(args.quiet);
+            let options: PushOptions = PushOptions {
                 destination,
                 server_name: args
                     .server_name
                     .clone()
                     .unwrap_or_else(|| cftp_core::identity::DEFAULT_SERVER_NAME.to_string()),
                 progress: Some(progress),
-                chunk_size: args.chunk_size,
-                pack_target: args.pack_target,
-                pack_max_files: args.pack_max_files,
-                small_file_max: args.small_file_max,
+                profile: requested_profile,
+                tuning,
+                profile_flag_used: selected.is_some(),
+                force_v2: false,
+                profile_requests: hotkeys.as_ref().map(|hotkeys| hotkeys.receiver.clone()),
             };
 
-            let mut prompted = false;
-            let result = loop {
+            let mut prompted: bool = false;
+            let result: Result<PushStats> = loop {
                 match push(&args.src, addr, &auth, options.clone()).await {
                     Ok(stats) => break Ok(stats),
                     Err(err) => {
@@ -230,11 +257,12 @@ async fn put(args: PutArgs) -> Result<()> {
                 }
             };
             drop(options);
+            drop(hotkeys);
             let _ = progress_task.await;
-            let stats = result?;
+            let stats: PushStats = result?;
             println!(
-                "sent {} files, {} bytes ({} packs, {} chunks)",
-                stats.files, stats.bytes, stats.packs, stats.chunks
+                "sent {} files, {} bytes ({} packs, {} chunks, profile {})",
+                stats.files, stats.bytes, stats.packs, stats.chunks, stats.effective_profile
             );
             Ok(())
         }
@@ -279,7 +307,11 @@ fn progress_channel(quiet: bool) -> (ProgressSender, tokio::task::JoinHandle<()>
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
         if quiet {
-            while rx.recv().await.is_some() {}
+            while let Some(event) = rx.recv().await {
+                if let ProgressEvent::Notice(message) = event {
+                    eprintln!("{message}");
+                }
+            }
             return;
         }
 
@@ -309,6 +341,9 @@ fn progress_channel(quiet: bool) -> (ProgressSender, tokio::task::JoinHandle<()>
                 }
                 ProgressEvent::Complete { .. } => {
                     bar.finish_with_message(format!("complete | {last_message}"));
+                }
+                ProgressEvent::Notice(message) => {
+                    bar.println(message);
                 }
             }
         }

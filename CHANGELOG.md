@@ -5,10 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-22
 
 ### Added
 
+- Light, default, and aggressive hardware profiles via `--light`, `--default`,
+  and `--aggressive`.
+- Live `l`/`d`/`a` profile hotkeys during `put`.
+- Server-side profile caps with accept/reject negotiation.
+- Network-adaptive aggressive compression based on link speed, measured
+  throughput, RTT, and loss.
+- `cftp/3` protocol alongside backward-compatible `cftp/2` fallback.
 - SSH-key authentication is now the default. Clients use `~/.ssh/id_*` and
   `~/.ssh/known_hosts`; servers use `~/.ssh/id_ed25519` as the host key and
   verify clients against `~/.ssh/authorized_keys`.
@@ -69,6 +76,6 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Received paths are normalized and confined to the destination root.
 - Files are written to temporary files and renamed into place after completion.
 
-[Unreleased]: https://github.com/connythecreator/cftp/compare/v0.1.1...HEAD
+[0.2.0]: https://github.com/connythecreator/cftp/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/connythecreator/cftp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/connythecreator/cftp/releases/tag/v0.1.0

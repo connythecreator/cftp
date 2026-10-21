@@ -18,6 +18,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 cftp-core = { path = "../cftp-core" }
 clap.workspace = true
+crossterm.workspace = true
 indicatif.workspace = true
 rpassword.workspace = true
 tokio.workspace = true

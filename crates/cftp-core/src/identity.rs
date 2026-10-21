@@ -14,6 +14,8 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
 
+use crate::tuning::Tuning;
+
 pub const DEFAULT_SERVER_NAME: &str = "cftp.local";
 
 #[derive(Debug, Clone)]
@@ -73,7 +75,7 @@ impl Identity {
         })
     }
 
-    pub fn server_config(&self) -> Result<quinn::ServerConfig> {
+    pub fn server_config(&self, tuning: &Tuning, force_v2: bool) -> Result<quinn::ServerConfig> {
         let mut roots = RootCertStore::empty();
         roots
             .add(self.ca.clone())
@@ -86,15 +88,15 @@ impl Identity {
             .with_safe_default_protocol_versions()?
             .with_client_cert_verifier(verifier)
             .with_single_cert(self.certs.clone(), self.key.clone_key())?;
-        config.alpn_protocols = vec![cftp_proto::ALPN.to_vec()];
+        config.alpn_protocols = alpn_protocols(force_v2);
 
         let quic = quinn::crypto::rustls::QuicServerConfig::try_from(config)?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic));
-        server.transport_config(Arc::new(transport_config()));
+        server.transport_config(Arc::new(transport_config(tuning)));
         Ok(server)
     }
 
-    pub fn client_config(&self) -> Result<quinn::ClientConfig> {
+    pub fn client_config(&self, tuning: &Tuning, force_v2: bool) -> Result<quinn::ClientConfig> {
         let mut roots = RootCertStore::empty();
         roots
             .add(self.ca.clone())
@@ -104,22 +106,28 @@ impl Identity {
             .with_safe_default_protocol_versions()?
             .with_root_certificates(roots)
             .with_client_auth_cert(self.certs.clone(), self.key.clone_key())?;
-        config.alpn_protocols = vec![cftp_proto::ALPN.to_vec()];
+        config.alpn_protocols = alpn_protocols(force_v2);
 
         let quic = quinn::crypto::rustls::QuicClientConfig::try_from(config)?;
         let mut client = quinn::ClientConfig::new(Arc::new(quic));
-        client.transport_config(Arc::new(transport_config()));
+        client.transport_config(Arc::new(transport_config(tuning)));
         Ok(client)
     }
 }
 
-pub(crate) fn transport_config() -> quinn::TransportConfig {
+pub(crate) fn transport_config(tuning: &Tuning) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(64));
-    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(64));
-    transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
-    transport.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
-    transport.send_window(64 * 1024 * 1024);
+    transport
+        .max_concurrent_bidi_streams(quinn::VarInt::from_u32(tuning.max_concurrent_bi_streams));
+    transport
+        .max_concurrent_uni_streams(quinn::VarInt::from_u32(tuning.max_concurrent_uni_streams));
+    transport.receive_window(
+        quinn::VarInt::from_u64(tuning.receive_window).expect("valid receive window"),
+    );
+    transport.stream_receive_window(
+        quinn::VarInt::from_u64(tuning.stream_receive_window).expect("valid stream receive window"),
+    );
+    transport.send_window(tuning.send_window);
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
     transport.max_idle_timeout(Some(
         Duration::from_secs(60)
@@ -127,6 +135,14 @@ pub(crate) fn transport_config() -> quinn::TransportConfig {
             .expect("valid idle timeout"),
     ));
     transport
+}
+
+pub(crate) fn alpn_protocols(force_v2: bool) -> Vec<Vec<u8>> {
+    if force_v2 {
+        vec![cftp_proto::ALPN_V2.to_vec()]
+    } else {
+        vec![cftp_proto::ALPN_V3.to_vec(), cftp_proto::ALPN_V2.to_vec()]
+    }
 }
 
 pub fn init_identity(paths: &IdentityPaths, force: bool) -> Result<IdentityInfo> {

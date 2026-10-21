@@ -18,6 +18,7 @@ pub enum ProgressEvent {
     Sending(TransferProgress),
     Receiving(TransferProgress),
     Complete { files: u64, bytes: u64 },
+    Notice(String),
 }
 
 pub type ProgressSender = tokio::sync::mpsc::UnboundedSender<ProgressEvent>;
