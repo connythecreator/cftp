@@ -1,6 +1,6 @@
 pkgbase = cftp
 	pkgdesc = QUIC-based file transfer with SSH-key authentication and optional mutual TLS
-	pkgver = 0.2.0
+	pkgver = 0.2.1
 	pkgrel = 1
 	url = https://github.com/connythecreator/cftp
 	arch = x86_64
@@ -10,7 +10,7 @@ pkgbase = cftp
 	depends = glibc
 	depends = gcc-libs
 	options = !lto
-	source = cftp-0.2.0.tar.gz::https://github.com/connythecreator/cftp/archive/refs/tags/v0.2.0.tar.gz
+	source = cftp-0.2.1.tar.gz::https://github.com/connythecreator/cftp/archive/refs/tags/v0.2.1.tar.gz
 	sha256sums = SKIP
 
 pkgname = cftp

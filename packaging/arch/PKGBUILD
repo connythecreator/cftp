@@ -1,6 +1,6 @@
 # Maintainer: Conleth <103609099@student.swin.edu.au>
 pkgname=cftp
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc='QUIC-based file transfer with SSH-key authentication and optional mutual TLS'
 arch=('x86_64')

@@ -1029,7 +1029,7 @@ pub async fn serve_once(auth: &ServerAuth, opts: ServeOptions) -> Result<ServeSt
         let _ = tokio::time::timeout(Duration::from_secs(1), connection_for_error.closed()).await;
     }
 
-    endpoint.wait_idle().await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
     endpoint.close(0u32.into(), b"done");
     result
 }
@@ -1329,7 +1329,7 @@ async fn receive_connection(
     control_send.finish()?;
     // Keep the connection alive long enough for the client to read the final
     // message. Dropping the last local handle closes the connection.
-    let _ = tokio::time::timeout(Duration::from_secs(3), connection.closed()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), connection.closed()).await;
     {
         let state = state.lock().await;
         if let Some(progress) = &state.progress {
