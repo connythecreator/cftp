@@ -22,3 +22,8 @@ updates:
       actions:
         patterns:
           - "*"
+    ignore:
+      # This action's ref is the Rust toolchain version (for example 1.88.0),
+      # not an action release. Dependabot otherwise proposes nonexistent
+      # toolchains such as 1.120.0.
+      - dependency-name: "dtolnay/rust-toolchain"
