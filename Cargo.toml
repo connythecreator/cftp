@@ -33,7 +33,7 @@ hmac = "0.12"
 indicatif = "0.18"
 netdev = "0.46"
 postcard = { version = "1.1", features = ["use-std"] }
-p256 = { version = "0.13", features = ["pkcs8"] }
+p256 = { version = "0.14", features = ["pkcs8"] }
 p384 = { version = "0.13", features = ["pkcs8"] }
 rcgen = { version = "0.14", features = ["pem"] }
 rsa = "0.9"
