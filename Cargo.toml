@@ -29,7 +29,7 @@ directories = "6"
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 filetime = "0.2"
 hex = "0.4"
-hmac = "0.12"
+hmac = "0.13"
 indicatif = "0.18"
 netdev = "0.46"
 postcard = { version = "1.1", features = ["use-std"] }
