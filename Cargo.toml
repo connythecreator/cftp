@@ -23,7 +23,7 @@ blake3 = "1.8"
 bytes = "1"
 clap = { version = "4.6", features = ["derive"] }
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 crossterm = "0.29"
 directories = "6"
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
