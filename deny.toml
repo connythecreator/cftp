@@ -3,6 +3,10 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+# The rsa crate is used only to parse/encode SSH RSA key material. TLS signing
+# and verification are performed by ring through rustls, so the Marvin timing
+# side-channel in rsa private-key operations is not reachable over the network.
+ignore = ["RUSTSEC-2023-0071"]
 unmaintained = "workspace"
 
 [licenses]
