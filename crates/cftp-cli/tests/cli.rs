@@ -1,5 +1,6 @@
 use std::fs;
 use std::net::UdpSocket;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,8 +9,17 @@ use assert_cmd::Command as AssertCommand;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
+/// Hard deadline for a single `cftp` invocation. A regression in the client's
+/// own timeouts should fail the test, not hang the suite.
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Overall deadline for the retry loop that waits for the one-shot server to
+/// start listening.
+const PUT_DEADLINE: Duration = Duration::from_secs(60);
+
 fn cftp() -> AssertCommand {
-    AssertCommand::cargo_bin("cftp").expect("cftp binary")
+    let mut command = AssertCommand::cargo_bin("cftp").expect("cftp binary");
+    command.timeout(TEST_TIMEOUT);
+    command
 }
 
 #[test]
@@ -29,7 +39,8 @@ fn reports_version_and_help() {
         .success()
         .stdout(predicate::str::contains("identity"))
         .stdout(predicate::str::contains("serve"))
-        .stdout(predicate::str::contains("put"));
+        .stdout(predicate::str::contains("put"))
+        .stdout(predicate::str::contains("get"));
 }
 
 #[test]
@@ -165,6 +176,7 @@ fn loopback_serve_and_put() {
         .arg(identity_dir.join("identity.key"))
         .arg("--client-ca")
         .arg(identity_dir.join("ca.pem"))
+        .arg("--one-shot")
         .arg("--quiet")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -174,12 +186,16 @@ fn loopback_serve_and_put() {
     let url = format!("cftp://127.0.0.1:{port}/incoming");
     let mut last_failure = None;
     let mut sent = false;
+    let deadline = Instant::now() + PUT_DEADLINE;
     for _ in 0..50 {
+        if Instant::now() > deadline {
+            break;
+        }
         if let Some(status) = server.try_wait().unwrap() {
             panic!("server exited before receiving a transfer: {status}");
         }
 
-        let output = Command::new(env!("CARGO_BIN_EXE_cftp"))
+        let output = cftp()
             .arg("put")
             .arg(&source)
             .arg(&url)
@@ -203,7 +219,7 @@ fn loopback_serve_and_put() {
 
     assert!(
         sent,
-        "put never succeeded: {}",
+        "put never succeeded within {PUT_DEADLINE:?}: {}",
         last_failure
             .map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
             .unwrap_or_default()
@@ -230,6 +246,106 @@ fn loopback_serve_and_put() {
 fn free_udp_port() -> u16 {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket.local_addr().unwrap().port()
+}
+
+fn put_to(identity_dir: &Path, src: &Path, url: &str) -> std::process::Output {
+    cftp()
+        .arg("put")
+        .arg(src)
+        .arg(url)
+        .arg("--identity")
+        .arg(identity_dir.join("identity.pem"))
+        .arg("--key")
+        .arg(identity_dir.join("identity.key"))
+        .arg("--server-ca")
+        .arg(identity_dir.join("ca.pem"))
+        .arg("--quiet")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn default_serve_stays_alive_for_repeated_transfers() {
+    let temp = tempdir().unwrap();
+    let identity_dir = temp.path().join("identity");
+    cftp()
+        .args(["identity", "init", "--dir"])
+        .arg(&identity_dir)
+        .assert()
+        .success();
+
+    let first = temp.path().join("first");
+    fs::create_dir_all(&first).unwrap();
+    fs::write(first.join("a.txt"), b"first\n").unwrap();
+    let second = temp.path().join("second");
+    fs::create_dir_all(&second).unwrap();
+    fs::write(second.join("b.txt"), b"second\n").unwrap();
+
+    let destination = temp.path().join("dst");
+    fs::create_dir_all(&destination).unwrap();
+
+    let port = free_udp_port();
+    let mut server = Command::new(env!("CARGO_BIN_EXE_cftp"))
+        .args(["serve", "--root"])
+        .arg(&destination)
+        .args(["--listen", &format!("127.0.0.1:{port}")])
+        .arg("--identity")
+        .arg(identity_dir.join("identity.pem"))
+        .arg("--key")
+        .arg(identity_dir.join("identity.key"))
+        .arg("--client-ca")
+        .arg(identity_dir.join("ca.pem"))
+        .arg("--quiet")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + PUT_DEADLINE;
+    let mut first_sent = false;
+    while Instant::now() < deadline {
+        if let Some(status) = server.try_wait().unwrap() {
+            panic!("server exited before receiving a transfer: {status}");
+        }
+        let output = put_to(
+            &identity_dir,
+            &first,
+            &format!("cftp://127.0.0.1:{port}/one"),
+        );
+        if output.status.success() {
+            first_sent = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(first_sent, "first transfer never succeeded");
+    assert!(
+        server.try_wait().unwrap().is_none(),
+        "default serve exited after a single transfer"
+    );
+
+    let output = put_to(
+        &identity_dir,
+        &second,
+        &format!("cftp://127.0.0.1:{port}/two"),
+    );
+    assert!(
+        output.status.success(),
+        "second transfer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        fs::read(destination.join("one/first/a.txt")).unwrap(),
+        b"first\n"
+    );
+    assert_eq!(
+        fs::read(destination.join("two/second/b.txt")).unwrap(),
+        b"second\n"
+    );
+
+    server.kill().unwrap();
+    server.wait().unwrap();
 }
 
 #[test]
@@ -275,6 +391,7 @@ fn loopback_serve_and_put_with_ssh_keys() {
         .arg(&server_key)
         .arg("--authorized-keys")
         .arg(&authorized_keys)
+        .arg("--one-shot")
         .arg("--quiet")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -284,12 +401,16 @@ fn loopback_serve_and_put_with_ssh_keys() {
     let url = format!("cftp://127.0.0.1:{port}/incoming");
     let mut last_failure = None;
     let mut sent = false;
+    let deadline = Instant::now() + PUT_DEADLINE;
     for _ in 0..50 {
+        if Instant::now() > deadline {
+            break;
+        }
         if let Some(status) = server.try_wait().unwrap() {
             panic!("server exited before receiving a transfer: {status}");
         }
 
-        let output = Command::new(env!("CARGO_BIN_EXE_cftp"))
+        let output = cftp()
             .arg("put")
             .arg(&source)
             .arg(&url)
@@ -312,7 +433,7 @@ fn loopback_serve_and_put_with_ssh_keys() {
 
     assert!(
         sent,
-        "put never succeeded: {}",
+        "put never succeeded within {PUT_DEADLINE:?}: {}",
         last_failure
             .map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
             .unwrap_or_default()
@@ -402,4 +523,161 @@ fn help_lists_hardware_profiles() {
         .stdout(predicate::str::contains("--light"))
         .stdout(predicate::str::contains("--default"))
         .stdout(predicate::str::contains("--aggressive"));
+}
+
+fn get_from(identity_dir: &Path, url: &str, dest: &Path) -> std::process::Output {
+    cftp()
+        .arg("get")
+        .arg(url)
+        .arg(dest)
+        .arg("--identity")
+        .arg(identity_dir.join("identity.pem"))
+        .arg("--key")
+        .arg(identity_dir.join("identity.key"))
+        .arg("--server-ca")
+        .arg(identity_dir.join("ca.pem"))
+        .arg("--quiet")
+        .output()
+        .unwrap()
+}
+
+fn spawn_serve(identity_dir: &Path, root: &Path, port: u16, extra: &[&str]) -> std::process::Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cftp"));
+    command
+        .args(["serve", "--root"])
+        .arg(root)
+        .args(["--listen", &format!("127.0.0.1:{port}")])
+        .arg("--identity")
+        .arg(identity_dir.join("identity.pem"))
+        .arg("--key")
+        .arg(identity_dir.join("identity.key"))
+        .arg("--client-ca")
+        .arg(identity_dir.join("ca.pem"))
+        .args(extra)
+        .arg("--quiet")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.spawn().unwrap()
+}
+
+fn wait_for_exit(server: &mut std::process::Child) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if server.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() > deadline {
+            let _ = server.kill();
+            panic!("one-shot server did not exit");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn loopback_serve_and_get() {
+    let temp = tempdir().unwrap();
+    let identity_dir = temp.path().join("identity");
+    cftp()
+        .args(["identity", "init", "--dir"])
+        .arg(&identity_dir)
+        .assert()
+        .success();
+
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join("project/src")).unwrap();
+    fs::write(root.join("project/src/file.txt"), b"pulled\n").unwrap();
+
+    let destination = temp.path().join("downloads");
+    let port = free_udp_port();
+    let mut server = spawn_serve(&identity_dir, &root, port, &["--one-shot"]);
+
+    let url = format!("cftp://127.0.0.1:{port}/project/");
+    let mut last_failure = None;
+    let mut received = false;
+    let deadline = Instant::now() + PUT_DEADLINE;
+    for _ in 0..50 {
+        if Instant::now() > deadline {
+            break;
+        }
+        if let Some(status) = server.try_wait().unwrap() {
+            panic!("server exited before serving a pull: {status}");
+        }
+        let output = get_from(&identity_dir, &url, &destination);
+        if output.status.success() {
+            received = true;
+            break;
+        }
+        last_failure = Some(output);
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    assert!(
+        received,
+        "get never succeeded within {PUT_DEADLINE:?}: {}",
+        last_failure
+            .map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
+            .unwrap_or_default()
+    );
+    wait_for_exit(&mut server);
+
+    assert_eq!(
+        fs::read(destination.join("src/file.txt")).unwrap(),
+        b"pulled\n"
+    );
+}
+
+#[test]
+fn serve_no_pull_refuses_get() {
+    let temp = tempdir().unwrap();
+    let identity_dir = temp.path().join("identity");
+    cftp()
+        .args(["identity", "init", "--dir"])
+        .arg(&identity_dir)
+        .assert()
+        .success();
+
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join("project")).unwrap();
+    fs::write(root.join("project/file.txt"), b"secret\n").unwrap();
+
+    let destination = temp.path().join("downloads");
+    let port = free_udp_port();
+    let mut server = spawn_serve(&identity_dir, &root, port, &["--one-shot", "--no-pull"]);
+
+    let url = format!("cftp://127.0.0.1:{port}/project/");
+    let deadline = Instant::now() + PUT_DEADLINE;
+    let mut refusal = None;
+    while Instant::now() < deadline {
+        if server.try_wait().unwrap().is_some() {
+            break;
+        }
+        let output = get_from(&identity_dir, &url, &destination);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if stderr.contains("pull is disabled") {
+            refusal = Some(stderr);
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let refusal = refusal.expect("server never reported that pull is disabled");
+    assert!(
+        refusal.contains("pull is disabled"),
+        "unexpected refusal: {refusal}"
+    );
+    assert!(!destination.join("file.txt").exists());
+    wait_for_exit(&mut server);
+}
+
+#[test]
+fn serve_rejects_disabling_both_modes() {
+    let temp = tempdir().unwrap();
+    cftp()
+        .arg("serve")
+        .arg("--root")
+        .arg(temp.path())
+        .arg("--no-push")
+        .arg("--no-pull")
+        .assert()
+        .failure();
 }

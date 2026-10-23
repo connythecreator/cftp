@@ -143,7 +143,9 @@ impl TuningController {
     }
 
     pub fn set_profile(&self, profile: HardwareProfile, link_speed: Option<u64>) {
-        let new: Tuning = Tuning::for_profile(profile, link_speed);
+        let old: Tuning = self.snapshot();
+        let mut new: Tuning = Tuning::for_profile(profile, link_speed);
+        preserve_overrides(&mut new, &old, link_speed);
         let mut current: std::sync::RwLockWriteGuard<'_, Tuning> =
             self.tuning.write().expect("tuning lock poisoned");
         resize_permits(&self.permits, current.encode_workers, new.encode_workers);
@@ -158,11 +160,46 @@ impl TuningController {
     }
 }
 
-fn resize_permits(permits: &Semaphore, old: usize, new: usize) {
+/// Carries explicit CLI overrides across a hotkey profile switch. A value is
+/// treated as an override when it differs from the old profile's default.
+fn preserve_overrides(new: &mut Tuning, old: &Tuning, link_speed: Option<u64>) {
+    let defaults: Tuning = Tuning::for_profile(old.profile, link_speed);
+    if old.chunk_size != defaults.chunk_size {
+        new.chunk_size = old.chunk_size;
+    }
+    if old.pack_target != defaults.pack_target {
+        new.pack_target = old.pack_target;
+    }
+    if old.pack_max_files != defaults.pack_max_files {
+        new.pack_max_files = old.pack_max_files;
+    }
+    if old.small_file_max != defaults.small_file_max {
+        new.small_file_max = old.small_file_max;
+    }
+}
+
+fn resize_permits(permits: &Arc<Semaphore>, old: usize, new: usize) {
     if new > old {
         permits.add_permits(new - old);
     } else if old > new {
-        permits.forget_permits(old - new);
+        // Permits currently held by encoding tasks cannot be forgotten yet.
+        // Reclaim the shortfall as they are released; otherwise the semaphore
+        // stays permanently over-provisioned after switching to a smaller
+        // profile.
+        let shortfall: usize = permits.forget_permits(old - new);
+        if shortfall > 0
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let permits: Arc<Semaphore> = permits.clone();
+            handle.spawn(async move {
+                for _ in 0..shortfall {
+                    let Ok(permit) = permits.acquire().await else {
+                        break;
+                    };
+                    permit.forget();
+                }
+            });
+        }
     }
 }
 

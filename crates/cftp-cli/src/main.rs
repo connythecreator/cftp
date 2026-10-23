@@ -2,11 +2,11 @@
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use cftp_cli::cli::{
-    AuthMode, Cli, Command, IdentityCommand, IdentityInitArgs, PutArgs, ServeArgs,
+    AuthMode, Cli, Command, GetArgs, IdentityCommand, IdentityInitArgs, PutArgs, ServeArgs,
 };
 use cftp_cli::hotkeys::Hotkeys;
 use cftp_core::auth::{
@@ -16,7 +16,10 @@ use cftp_core::identity::{Identity, IdentityPaths, init_identity};
 use cftp_core::local::{LocalCopyStats, copy_local};
 use cftp_core::progress::{ProgressEvent, ProgressSender, TransferProgress};
 use cftp_core::ssh::{SshPaths, load_private_key};
-use cftp_core::transfer::{PushOptions, PushStats, ServeOptions, ServeStats, push, serve_once};
+use cftp_core::transfer::{
+    PullOptions, PullStats, PushOptions, PushStats, ServeOptions, ServePolicy, ServeStats, pull,
+    push, serve,
+};
 use cftp_core::trust::{AuthorizedKeys, KnownHostsStore};
 use cftp_core::tuning::{HardwareProfile, Tuning};
 use clap::Parser;
@@ -39,8 +42,9 @@ async fn main() -> Result<()> {
         Command::Identity { command } => match command {
             IdentityCommand::Init(args) => init(args),
         },
-        Command::Serve(args) => serve(args).await,
+        Command::Serve(args) => run_serve(args).await,
         Command::Put(args) => put(args).await,
+        Command::Get(args) => get(args).await,
     }
 }
 
@@ -61,7 +65,7 @@ fn init(args: IdentityInitArgs) -> Result<()> {
     Ok(())
 }
 
-async fn serve(args: ServeArgs) -> Result<()> {
+async fn run_serve(args: ServeArgs) -> Result<()> {
     let use_cert: bool = matches!(args.auth, AuthMode::Cert)
         || (matches!(args.auth, AuthMode::Auto)
             && (args.identity.is_some() || args.key.is_some() || args.client_ca.is_some()));
@@ -97,37 +101,85 @@ async fn serve(args: ServeArgs) -> Result<()> {
         ServerAuth::Ssh(SshServerAuth::new(host_key, authorized_keys))
     };
 
-    println!(
-        "listening on {} (root {})",
-        args.listen,
-        args.root.display()
-    );
-
     let (progress, progress_task): (ProgressSender, tokio::task::JoinHandle<()>) =
         progress_channel(args.quiet);
     let max_profile: HardwareProfile = args.hardware.selected().unwrap_or(HardwareProfile::Default);
     println!("hardware profile cap: {max_profile}");
+    let policy: ServePolicy = ServePolicy {
+        allow_push: !args.no_push,
+        allow_pull: !args.no_pull,
+    };
+    println!(
+        "policy: {}",
+        match (policy.allow_push, policy.allow_pull) {
+            (true, true) => "push and pull",
+            (true, false) => "push only",
+            (false, true) => "pull only",
+            (false, false) => "no transfers",
+        }
+    );
+    let root_display: String = args.root.display().to_string();
+    let listen: std::net::SocketAddr = args.listen;
+    let one_shot: bool = args.one_shot;
+    let max_sessions: usize = args.max_sessions;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<ServeStats>();
+    let reporter = tokio::spawn(async move {
+        while let Some(stats) = session_rx.recv().await {
+            println!(
+                "transferred {} files, {} bytes with {} (profile {})",
+                stats.files,
+                stats.bytes,
+                stats
+                    .peer
+                    .map(|peer| peer.to_string())
+                    .unwrap_or_else(|| "unknown peer".to_string()),
+                stats.effective_profile
+            );
+        }
+    });
     let options: ServeOptions = ServeOptions {
         root: args.root,
-        listen: args.listen,
+        listen,
         progress: Some(progress),
-        on_ready: None,
+        on_ready: Some(ready_tx),
         max_profile,
         force_v2: false,
+        policy,
+        one_shot,
+        max_sessions: max_sessions.max(1),
+        on_session: Some(session_tx),
     };
-    let result: Result<ServeStats> = serve_once(&auth, options).await;
+    // Run the server in a task so the bound address can be reported once the
+    // socket actually exists (and so a failed bind is reported as an error).
+    let server = tokio::spawn(async move { serve(&auth, options).await });
+    if let Ok(addr) = ready_rx.await {
+        println!("listening on {addr} (root {root_display})");
+        if one_shot {
+            println!("waiting for one transfer (--one-shot)");
+        } else {
+            println!("waiting for transfers (up to {max_sessions} at a time)");
+        }
+    }
+    let result: Result<ServeStats> = match server.await {
+        Ok(result) => result,
+        Err(err) => Err(anyhow::anyhow!("server task panicked: {err}")),
+    };
     let _ = progress_task.await;
     let stats: ServeStats = result?;
-    println!(
-        "received {} files, {} bytes from {} (profile {})",
-        stats.files,
-        stats.bytes,
-        stats
-            .peer
-            .map(|peer| peer.to_string())
-            .unwrap_or_else(|| "unknown peer".to_string()),
-        stats.effective_profile
-    );
+    if one_shot {
+        println!(
+            "transferred {} files, {} bytes with {} (profile {})",
+            stats.files,
+            stats.bytes,
+            stats
+                .peer
+                .map(|peer| peer.to_string())
+                .unwrap_or_else(|| "unknown peer".to_string()),
+            stats.effective_profile
+        );
+    }
+    reporter.abort();
     Ok(())
 }
 
@@ -152,9 +204,19 @@ async fn put(args: PutArgs) -> Result<()> {
             port,
             destination,
         } => {
-            let addr = lookup_host((host.as_str(), port))
-                .await
-                .with_context(|| format!("failed to resolve {host}:{port}"))?
+            let (progress, progress_task): (ProgressSender, tokio::task::JoinHandle<()>) =
+                progress_channel(args.quiet);
+            let _ = progress.send(ProgressEvent::Notice(format!("resolving {host}:{port}")));
+            let mut resolved = match tokio::time::timeout(
+                Duration::from_secs(30),
+                lookup_host((host.as_str(), port)),
+            )
+            .await
+            {
+                Err(_) => bail!("timed out after 30s resolving {host}:{port}"),
+                Ok(result) => result.with_context(|| format!("failed to resolve {host}:{port}"))?,
+            };
+            let addr = resolved
                 .next()
                 .with_context(|| format!("{host}:{port} did not resolve to an address"))?;
 
@@ -213,8 +275,6 @@ async fn put(args: PutArgs) -> Result<()> {
             if hotkeys.is_some() && !args.quiet {
                 eprintln!("profiles: [l]ight [d]efault [a]ggressive");
             }
-            let (progress, progress_task): (ProgressSender, tokio::task::JoinHandle<()>) =
-                progress_channel(args.quiet);
             let options: PushOptions = PushOptions {
                 destination,
                 server_name: args
@@ -269,6 +329,141 @@ async fn put(args: PutArgs) -> Result<()> {
     }
 }
 
+async fn get(args: GetArgs) -> Result<()> {
+    match parse_destination(&args.src)? {
+        Destination::Local(source) => {
+            let (progress, progress_task): (ProgressSender, tokio::task::JoinHandle<()>) =
+                progress_channel(args.quiet);
+            let result = copy_local(&source, &args.dest, Some(progress)).await;
+            let _ = progress_task.await;
+            let stats: LocalCopyStats = result?;
+            println!(
+                "copied {} files, {} bytes to {}",
+                stats.files,
+                stats.bytes,
+                args.dest.display()
+            );
+            Ok(())
+        }
+        Destination::Remote {
+            host,
+            port,
+            destination: source,
+        } => {
+            let (progress, progress_task): (ProgressSender, tokio::task::JoinHandle<()>) =
+                progress_channel(args.quiet);
+            let _ = progress.send(ProgressEvent::Notice(format!("resolving {host}:{port}")));
+            let mut resolved = match tokio::time::timeout(
+                Duration::from_secs(30),
+                lookup_host((host.as_str(), port)),
+            )
+            .await
+            {
+                Err(_) => bail!("timed out after 30s resolving {host}:{port}"),
+                Ok(result) => result.with_context(|| format!("failed to resolve {host}:{port}"))?,
+            };
+            let addr = resolved
+                .next()
+                .with_context(|| format!("{host}:{port} did not resolve to an address"))?;
+
+            let use_cert: bool = matches!(args.auth, AuthMode::Cert)
+                || (matches!(args.auth, AuthMode::Auto)
+                    && (args.identity.is_some() || args.key.is_some() || args.server_ca.is_some()));
+
+            let auth: ClientAuth = if use_cert {
+                let defaults = IdentityPaths::user()?;
+                let identity_path = args.identity.unwrap_or(defaults.cert);
+                let key_path = args.key.unwrap_or(defaults.key);
+                let ca_path = args.server_ca.unwrap_or(defaults.ca);
+                let identity = Identity::load(&identity_path, &key_path, &ca_path)?;
+                ClientAuth::Cert(identity)
+            } else {
+                let paths = SshPaths::user()?;
+                let key_path = match args.ssh_key {
+                    Some(path) => path,
+                    None => paths.existing_client_key().with_context(|| {
+                        format!(
+                            "no SSH private key found in {}; create one with `ssh-keygen -t ed25519` or pass --ssh-key",
+                            paths.dir.display()
+                        )
+                    })?,
+                };
+                let known_hosts_path = args.known_hosts.unwrap_or(paths.known_hosts);
+                let known_hosts = KnownHostsStore::load(&known_hosts_path)?;
+                let policy = if args.accept_new {
+                    HostKeyPolicy::AcceptNew
+                } else {
+                    HostKeyPolicy::Ask
+                };
+                let key = load_private_key(&key_path, prompt_passphrase)?;
+                ClientAuth::Ssh(SshClientAuth::new(
+                    key,
+                    known_hosts,
+                    host.clone(),
+                    port,
+                    policy,
+                ))
+            };
+
+            let selected: Option<HardwareProfile> = args.hardware.selected();
+            let requested_profile: HardwareProfile = selected.unwrap_or(HardwareProfile::Default);
+            let tuning: Tuning = match selected {
+                Some(profile) => Tuning::for_profile(profile, None),
+                None => Tuning::default(),
+            };
+            let options: PullOptions = PullOptions {
+                source,
+                destination: args.dest,
+                server_name: args
+                    .server_name
+                    .clone()
+                    .unwrap_or_else(|| cftp_core::identity::DEFAULT_SERVER_NAME.to_string()),
+                progress: Some(progress),
+                profile: requested_profile,
+                tuning,
+            };
+
+            let mut prompted: bool = false;
+            let result: Result<PullStats> = loop {
+                match pull(addr, &auth, options.clone()).await {
+                    Ok(stats) => break Ok(stats),
+                    Err(err) => {
+                        if let Some(unknown) = err.downcast_ref::<UnknownHostKey>()
+                            && !prompted
+                            && !args.accept_new
+                        {
+                            prompted = true;
+                            if confirm_unknown_host(unknown)? {
+                                if let ClientAuth::Ssh(auth) = &auth {
+                                    auth.accept_host_key(&unknown.public_key)?;
+                                    println!(
+                                        "added host key for {}:{} to {}",
+                                        unknown.host,
+                                        unknown.port,
+                                        auth.known_hosts_path().display()
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                        break Err(err);
+                    }
+                }
+            };
+            // The options own a progress sender; drop it so the renderer task
+            // can see the channel close and exit.
+            drop(options);
+            let _ = progress_task.await;
+            let stats: PullStats = result?;
+            println!(
+                "received {} files, {} bytes (profile {})",
+                stats.files, stats.bytes, stats.effective_profile
+            );
+            Ok(())
+        }
+    }
+}
+
 enum Destination {
     Remote {
         host: String,
@@ -306,44 +501,85 @@ fn parse_destination(dest: &str) -> Result<Destination> {
 fn progress_channel(quiet: bool) -> (ProgressSender, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
-        if quiet {
-            while let Some(event) = rx.recv().await {
-                if let ProgressEvent::Notice(message) = event {
-                    eprintln!("{message}");
-                }
-            }
-            return;
-        }
-
-        let bar = ProgressBar::new(0);
-        bar.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
-        );
+        let bar: Option<ProgressBar> = if quiet {
+            None
+        } else {
+            let bar = ProgressBar::new(0);
+            bar.set_style(
+                ProgressStyle::with_template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}",
+                )
+                .unwrap()
+                .progress_chars("=>-"),
+            );
+            // Redraw on a timer so the spinner and elapsed time keep moving even
+            // when the peer is between events.
+            bar.enable_steady_tick(Duration::from_millis(250));
+            Some(bar)
+        };
         let mut tracker = RateTracker::new();
         let mut last_message = String::from("0 files");
-        while let Some(event) = rx.recv().await {
-            match event {
-                ProgressEvent::Scan { files, bytes } => {
-                    bar.set_length(bytes);
-                    last_message = format!("{files} files");
-                    bar.set_message(last_message.clone());
+        let mut last_event = Instant::now();
+        let mut last_stall = Instant::now();
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    last_event = Instant::now();
+                    last_stall = Instant::now();
+                    match event {
+                        ProgressEvent::Scan { files, bytes } => {
+                            if let Some(bar) = &bar {
+                                bar.set_length(bytes);
+                            }
+                            last_message = format!("{files} files");
+                            if let Some(bar) = &bar {
+                                bar.set_message(last_message.clone());
+                            }
+                        }
+                        ProgressEvent::Sending(stats) | ProgressEvent::Receiving(stats) => {
+                            if let Some(bar) = &bar {
+                                bar.set_length(stats.bytes_total);
+                                bar.set_position(stats.bytes_done);
+                            }
+                            let rates = tracker.update(&stats);
+                            last_message = format_progress(&stats, &rates);
+                            if let Some(bar) = &bar {
+                                bar.set_message(last_message.clone());
+                            }
+                        }
+                        ProgressEvent::Complete { .. } => {
+                            if let Some(bar) = &bar {
+                                bar.finish_with_message(format!("complete | {last_message}"));
+                            }
+                        }
+                        ProgressEvent::Notice(message) => match &bar {
+                            Some(bar) => bar.println(message),
+                            None => eprintln!("{message}"),
+                        },
+                    }
                 }
-                ProgressEvent::Sending(stats) | ProgressEvent::Receiving(stats) => {
-                    bar.set_length(stats.bytes_total);
-                    bar.set_position(stats.bytes_done);
-                    let rates = tracker.update(&stats);
-                    last_message = format_progress(&stats, &rates);
-                    bar.set_message(last_message.clone());
-                }
-                ProgressEvent::Complete { .. } => {
-                    bar.finish_with_message(format!("complete | {last_message}"));
-                }
-                ProgressEvent::Notice(message) => {
-                    bar.println(message);
+                _ = ticker.tick() => {
+                    // Event-driven progress freezes completely when a peer goes
+                    // quiet; say so instead of leaving a stale display.
+                    if last_event.elapsed() >= Duration::from_secs(15)
+                        && last_stall.elapsed() >= Duration::from_secs(15)
+                    {
+                        last_stall = Instant::now();
+                        let message = format!(
+                            "still working: no progress update for {}s",
+                            last_event.elapsed().as_secs()
+                        );
+                        match &bar {
+                            Some(bar) => bar.println(message),
+                            None => eprintln!("{message}"),
+                        }
+                    }
                 }
             }
         }

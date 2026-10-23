@@ -141,7 +141,11 @@ pub(crate) fn alpn_protocols(force_v2: bool) -> Vec<Vec<u8>> {
     if force_v2 {
         vec![cftp_proto::ALPN_V2.to_vec()]
     } else {
-        vec![cftp_proto::ALPN_V3.to_vec(), cftp_proto::ALPN_V2.to_vec()]
+        vec![
+            cftp_proto::ALPN_V4.to_vec(),
+            cftp_proto::ALPN_V3.to_vec(),
+            cftp_proto::ALPN_V2.to_vec(),
+        ]
     }
 }
 

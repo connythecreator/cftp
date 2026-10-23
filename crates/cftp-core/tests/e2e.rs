@@ -4,7 +4,9 @@ use std::time::Duration;
 use cftp_core::auth::{ClientAuth, ServerAuth};
 use cftp_core::identity::{DEFAULT_SERVER_NAME, Identity, IdentityPaths, init_identity};
 use cftp_core::progress::ProgressEvent;
-use cftp_core::transfer::{PushOptions, ServeOptions, push, serve_once};
+use cftp_core::transfer::{
+    PullOptions, PushOptions, ServeOptions, ServePolicy, pull, push, serve_once,
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfers_a_tree_over_mutual_tls() {
@@ -59,6 +61,10 @@ async fn transfers_a_tree_over_mutual_tls() {
         on_ready: Some(ready_tx),
         max_profile: cftp_core::tuning::HardwareProfile::Default,
         force_v2: false,
+        policy: cftp_core::transfer::ServePolicy::default(),
+        one_shot: true,
+        max_sessions: cftp_core::transfer::MAX_CONCURRENT_SESSIONS,
+        on_session: None,
     };
     let server_identity = ServerAuth::Cert(server_identity);
     let server = tokio::spawn(async move { serve_once(&server_identity, server_opts).await });
@@ -264,6 +270,10 @@ async fn rejects_invalid_destination_without_hanging() {
                 on_ready: Some(ready_tx),
                 max_profile: cftp_core::tuning::HardwareProfile::Default,
                 force_v2: false,
+                policy: cftp_core::transfer::ServePolicy::default(),
+                one_shot: true,
+                max_sessions: cftp_core::transfer::MAX_CONCURRENT_SESSIONS,
+                on_session: None,
             },
         )
         .await
@@ -377,6 +387,10 @@ async fn transfers_a_tree_over_ssh_keys() {
                 on_ready: Some(ready_tx),
                 max_profile: cftp_core::tuning::HardwareProfile::Default,
                 force_v2: false,
+                policy: cftp_core::transfer::ServePolicy::default(),
+                one_shot: true,
+                max_sessions: cftp_core::transfer::MAX_CONCURRENT_SESSIONS,
+                on_session: None,
             },
         )
         .await
@@ -479,6 +493,10 @@ async fn run_profile_transfer(
                 on_ready: Some(ready_tx),
                 max_profile: server_cap,
                 force_v2,
+                policy: cftp_core::transfer::ServePolicy::default(),
+                one_shot: true,
+                max_sessions: cftp_core::transfer::MAX_CONCURRENT_SESSIONS,
+                on_session: None,
             },
         )
         .await
@@ -581,4 +599,235 @@ async fn hotswaps_profile_during_transfer() {
         stats.effective_profile,
         HardwareProfile::Light | HardwareProfile::Aggressive
     ));
+}
+
+fn cert_pair(temp: &tempfile::TempDir) -> (ServerAuth, ClientAuth) {
+    let identity_paths = IdentityPaths::in_dir(temp.path().join("identity"));
+    init_identity(&identity_paths, true).unwrap();
+    let server = Identity::load(
+        &identity_paths.cert,
+        &identity_paths.key,
+        &identity_paths.ca,
+    )
+    .unwrap();
+    let client = Identity::load(
+        &identity_paths.cert,
+        &identity_paths.key,
+        &identity_paths.ca,
+    )
+    .unwrap();
+    (ServerAuth::Cert(server), ClientAuth::Cert(client))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pulls_a_tree_over_mutual_tls() {
+    let temp = tempfile::tempdir().unwrap();
+    let (server_auth, client_auth) = cert_pair(&temp);
+
+    let root = temp.path().join("served");
+    let project = root.join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::create_dir_all(project.join("empty-dir")).unwrap();
+    fs::write(project.join("src/main.js"), b"console.log('pulled')\n").unwrap();
+    fs::write(project.join("empty.txt"), b"").unwrap();
+    fs::write(project.join("large.bin"), vec![0x42; 2 * 1024 * 1024]).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("src/main.js", project.join("link.js")).unwrap();
+
+    let destination = temp.path().join("downloads");
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_once(
+            &server_auth,
+            ServeOptions {
+                root,
+                listen: "127.0.0.1:0".parse().unwrap(),
+                progress: None,
+                on_ready: Some(ready_tx),
+                max_profile: cftp_core::tuning::HardwareProfile::Default,
+                force_v2: false,
+                policy: ServePolicy::default(),
+                one_shot: true,
+                max_sessions: cftp_core::transfer::MAX_CONCURRENT_SESSIONS,
+                on_session: None,
+            },
+        )
+        .await
+    });
+    let addr = ready_rx.await.unwrap();
+
+    let stats = pull(
+        addr,
+        &client_auth,
+        PullOptions {
+            source: "project/".into(),
+            destination: destination.clone(),
+            server_name: DEFAULT_SERVER_NAME.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("pull failed");
+    assert_eq!(stats.files, 3);
+    assert_eq!(stats.bytes, 22 + 2 * 1024 * 1024);
+    server.await.unwrap().unwrap();
+
+    assert_eq!(
+        fs::read(destination.join("src/main.js")).unwrap(),
+        b"console.log('pulled')\n"
+    );
+    assert!(destination.join("empty.txt").exists());
+    assert!(destination.join("empty-dir").is_dir());
+    assert_eq!(
+        fs::read(destination.join("large.bin")).unwrap(),
+        vec![0x42; 2 * 1024 * 1024]
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        fs::read_link(destination.join("link.js")).unwrap(),
+        std::path::PathBuf::from("src/main.js")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preserves_the_directory_name_without_a_trailing_slash() {
+    let temp = tempfile::tempdir().unwrap();
+    let (server_auth, client_auth) = cert_pair(&temp);
+
+    let root = temp.path().join("served");
+    fs::create_dir_all(root.join("project/src")).unwrap();
+    fs::write(root.join("project/src/main.js"), b"pulled\n").unwrap();
+
+    let destination = temp.path().join("downloads");
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_once(
+            &server_auth,
+            ServeOptions {
+                root,
+                listen: "127.0.0.1:0".parse().unwrap(),
+                progress: None,
+                on_ready: Some(ready_tx),
+                max_profile: cftp_core::tuning::HardwareProfile::Default,
+                force_v2: false,
+                policy: ServePolicy::default(),
+                one_shot: true,
+                max_sessions: cftp_core::transfer::MAX_CONCURRENT_SESSIONS,
+                on_session: None,
+            },
+        )
+        .await
+    });
+    let addr = ready_rx.await.unwrap();
+
+    pull(
+        addr,
+        &client_auth,
+        PullOptions {
+            source: "project".into(),
+            destination: destination.clone(),
+            server_name: DEFAULT_SERVER_NAME.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("pull failed");
+    server.await.unwrap().unwrap();
+
+    assert_eq!(
+        fs::read(destination.join("project/src/main.js")).unwrap(),
+        b"pulled\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn policy_rejects_disabled_modes() {
+    let temp = tempfile::tempdir().unwrap();
+    let (server_auth, client_auth) = cert_pair(&temp);
+    let root = temp.path().join("served");
+    fs::create_dir_all(root.join("project")).unwrap();
+    fs::write(root.join("project/a.txt"), b"data").unwrap();
+
+    // Pull-only server: a push is refused with a clear message.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let server_root = root.clone();
+    let server = tokio::spawn(async move {
+        serve_once(
+            &server_auth,
+            ServeOptions {
+                root: server_root,
+                listen: "127.0.0.1:0".parse().unwrap(),
+                progress: None,
+                on_ready: Some(ready_tx),
+                max_profile: cftp_core::tuning::HardwareProfile::Default,
+                force_v2: false,
+                policy: ServePolicy::pull_only(),
+                one_shot: true,
+                max_sessions: cftp_core::transfer::MAX_CONCURRENT_SESSIONS,
+                on_session: None,
+            },
+        )
+        .await
+    });
+    let addr = ready_rx.await.unwrap();
+    let source = temp.path().join("incoming");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.txt"), b"data").unwrap();
+    let err = push(
+        &source,
+        addr,
+        &client_auth,
+        PushOptions {
+            server_name: DEFAULT_SERVER_NAME.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("push should be refused");
+    assert!(
+        format!("{err:#}").contains("push is disabled"),
+        "unexpected error: {err:#}"
+    );
+    assert!(server.await.unwrap().is_err());
+
+    // Push-only server: a pull is refused before any scan or data.
+    let (server_auth, client_auth) = cert_pair(&temp);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_once(
+            &server_auth,
+            ServeOptions {
+                root,
+                listen: "127.0.0.1:0".parse().unwrap(),
+                progress: None,
+                on_ready: Some(ready_tx),
+                max_profile: cftp_core::tuning::HardwareProfile::Default,
+                force_v2: false,
+                policy: ServePolicy::push_only(),
+                one_shot: true,
+                max_sessions: cftp_core::transfer::MAX_CONCURRENT_SESSIONS,
+                on_session: None,
+            },
+        )
+        .await
+    });
+    let addr = ready_rx.await.unwrap();
+    let destination = temp.path().join("downloads");
+    let err = pull(
+        addr,
+        &client_auth,
+        PullOptions {
+            source: "project/a.txt".into(),
+            destination,
+            server_name: DEFAULT_SERVER_NAME.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("pull should be refused");
+    assert!(
+        format!("{err:#}").contains("pull is disabled"),
+        "unexpected error: {err:#}"
+    );
+    assert!(server.await.unwrap().is_err());
 }

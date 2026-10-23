@@ -65,8 +65,11 @@ pub fn scan_source(src: &Path) -> Result<ScanResult> {
     let total_bytes = entries
         .iter()
         .filter(|entry| entry.kind == EntryKind::File)
-        .map(|entry| entry.size)
-        .sum();
+        .try_fold(0u64, |total, entry| {
+            total
+                .checked_add(entry.size)
+                .context("source size does not fit in u64")
+        })?;
     let total_files = entries
         .iter()
         .filter(|entry| entry.kind == EntryKind::File)

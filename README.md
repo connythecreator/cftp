@@ -1,3 +1,9 @@
+<!-- markdownlint-disable MD033 MD041 -->
+<p align="center">
+  <img src="assets/cftp-logo.png" alt="cftp logo" width="200">
+</p>
+<!-- markdownlint-enable MD033 -->
+
 # cftp
 
 Fast file and directory transfers over QUIC, with mutual TLS and zstd compression.
@@ -6,14 +12,17 @@ Fast file and directory transfers over QUIC, with mutual TLS and zstd compressio
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://www.rust-lang.org)
 
-cftp (Connys File Transfer Program) pushes files and directory trees to a remote
-receiver over QUIC. It authenticates with SSH keys by default, uses zstd for
-compression, and BLAKE3 for integrity checks. Small files are packed together and
-large files are split into chunks.
+cftp (Connys File Transfer Program) pushes and pulls files and directory trees
+over QUIC. It authenticates with SSH keys by default, uses zstd for compression,
+and BLAKE3 for integrity checks. Small files are packed together and large files
+are split into chunks. The server is authoritative: it decides which modes it
+accepts and which paths clients may read or write.
 
 ## Features
 
-- QUIC transport with ALPN `cftp/3` and automatic `cftp/2` fallback.
+- QUIC transport with ALPN `cftp/4`, `cftp/3`, and `cftp/2` fallback.
+- Push (`put`) and pull (`get`) from the same server.
+- Server-side policy: `serve --no-push`, `serve --no-pull`, or both modes.
 - SSH-key authentication by default, using `authorized_keys` and `known_hosts`.
 - Optional mutual TLS with a local CA.
 - Light, default, and aggressive hardware profiles.
@@ -30,6 +39,7 @@ large files are split into chunks.
 
 ## Documentation
 
+- [Wiki home](docs/wiki/Home.md)
 - [Architecture and protocol](docs/architecture.md)
 - [Packaging and releases](docs/packaging.md)
 - [Contributing](.github/CONTRIBUTING.md)
@@ -102,8 +112,19 @@ The sender uses the first existing key from `~/.ssh/id_ed25519`,
 fingerprint and asks you to confirm it, like `scp`. In scripts, pass
 `--accept-new` to add an unknown host key automatically.
 
-The receiver writes the transfer under `./incoming/project/`. `serve` is
-one-shot: it accepts one connection, receives the transfer, then exits.
+The receiver writes the transfer under `./incoming/project/`. By default
+`serve` stays alive and accepts further transfers (up to four at a time); pass
+`--one-shot` to make it exit after the first successful transfer.
+
+To pull from the same receiver, point `get` at a path under its root:
+
+```bash
+cftp get cftp://receiver:4433/project/ ./downloads
+```
+
+Pull requires `cftp/4` on both peers. The server decides whether pushes and
+pulls are allowed; with `serve --no-pull` a client's `get` fails with a clear
+message before any data is sent.
 
 During a remote `put`, press `l`, `d`, or `a` to switch between light, default,
 and aggressive profiles without restarting the transfer. The server may reject
@@ -126,8 +147,9 @@ to choose zstd levels while the transfer runs.
 Profiles are mutually exclusive with `--chunk-size`, `--pack-target`,
 `--pack-max-files`, and `--small-file-max`.
 
-Older `cftp/2` peers still work. Profile flags and hotkeys are ignored on
-`cftp/2`.
+Older `cftp/2` and `cftp/3` peers still work for pushes. Profile flags and
+hotkeys are ignored on `cftp/2`, and pull is refused unless both peers speak
+`cftp/4`.
 
 To copy locally instead of over the network:
 
@@ -140,6 +162,15 @@ source directory name is preserved:
 
 ```bash
 cftp put ./project/ cftp://receiver:4433/destination
+```
+
+`get` follows the same rule for the remote source, and the result is written
+under the local destination:
+
+```bash
+cftp get cftp://receiver:4433/project/ ./downloads   # contents of project/
+cftp get cftp://receiver:4433/project ./downloads    # downloads/project/
+cftp get ./backup ./restored                         # local copy
 ```
 
 ### Manual certificate mode
@@ -178,8 +209,12 @@ On Linux the default directory is `~/.config/cftp`.
 
 | Flag | Description |
 | --- | --- |
-| `--root <DIR>` | Required. Directory that received files are written under. |
+| `--root <DIR>` | Required. Directory that received files are written under and pulled files are read from. |
 | `--listen <ADDR>` | UDP address to listen on. Defaults to `0.0.0.0:4433`. |
+| `--one-shot` | Exit after the first successful transfer instead of staying alive. |
+| `--no-push` | Refuse pushes from clients. |
+| `--no-pull` | Refuse pulls from clients. |
+| `--max-sessions <N>` | Maximum concurrent transfers while staying alive. Defaults to 4. |
 | `--auth <auto\|ssh\|cert>` | Authentication backend. Defaults to `auto`. |
 | `--light` / `--default` / `--aggressive` | Maximum hardware profile accepted from clients. Defaults to `default`. |
 | `--host-key <FILE>` | SSH host key. Defaults to `~/.ssh/id_ed25519`. |
@@ -212,6 +247,27 @@ On Linux the default directory is `~/.config/cftp`.
 
 The default port for a remote destination is `4433`. Only the `cftp://` scheme
 is accepted; any other `://` destination is rejected.
+
+### `cftp get`
+
+| Argument or flag | Description |
+| --- | --- |
+| `<SRC>` | A `cftp://host[:port]/path` URL, or a local source file or directory. |
+| `<DEST>` | Local destination directory. |
+| `--auth <auto\|ssh\|cert>` | Authentication backend. Defaults to `auto`. |
+| `--light` / `--default` / `--aggressive` | Requested hardware profile. Defaults to `default`. |
+| `--ssh-key <FILE>` | SSH private key presented to the server. Defaults to the first of `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`. |
+| `--known-hosts <FILE>` | Host keys used to verify the server. Defaults to `~/.ssh/known_hosts`. |
+| `--accept-new` | Add an unknown server host key to `known_hosts` without prompting. |
+| `--identity <FILE>` | Leaf certificate presented to the server (cert mode). |
+| `--key <FILE>` | Private key for the leaf certificate (cert mode). |
+| `--server-ca <FILE>` | CA used to verify the server certificate (cert mode). |
+| `--server-name <NAME>` | Expected server name. Defaults to `cftp.local`. |
+| `--quiet` | Disable the progress bar. |
+
+A remote `get` requires `cftp/4`. The server resolves the requested path under
+its root, refusing traversal and symlink escapes, and streams the tree using the
+same packs and chunks as `put`.
 
 ## Throughput
 
