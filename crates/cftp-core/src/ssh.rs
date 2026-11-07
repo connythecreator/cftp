@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use directories::BaseDirs;
-use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use rsa::traits::PublicKeyParts;
 use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use ssh_key::HashAlg;
@@ -12,7 +11,11 @@ use ssh_key::public::{EcdsaPublicKey, KeyData};
 
 #[derive(Debug, Clone)]
 pub struct SshPaths {
+    /// cftp's own configuration directory (`~/.config/cftp`): host key and
+    /// known_hosts live here so they never collide with OpenSSH's files.
     pub dir: PathBuf,
+    /// The user's OpenSSH directory (`~/.ssh`): client keys and authorized_keys.
+    pub ssh_dir: PathBuf,
     pub host_key: PathBuf,
     pub authorized_keys: PathBuf,
     pub known_hosts: PathBuf,
@@ -21,24 +24,34 @@ pub struct SshPaths {
 impl SshPaths {
     pub fn user() -> Result<Self> {
         let base = BaseDirs::new().context("could not determine the home directory")?;
-        Ok(Self::in_dir(base.home_dir().join(".ssh")))
+        let dir: PathBuf = base.config_dir().join("cftp");
+        let ssh_dir: PathBuf = base.home_dir().join(".ssh");
+        Ok(Self {
+            host_key: dir.join("host_key"),
+            authorized_keys: ssh_dir.join("authorized_keys"),
+            known_hosts: dir.join("known_hosts"),
+            dir,
+            ssh_dir,
+        })
     }
 
+    /// Places every file under one directory. Useful for tests and embedded use.
     pub fn in_dir(dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         Self {
-            host_key: dir.join("id_ed25519"),
+            host_key: dir.join("host_key"),
             authorized_keys: dir.join("authorized_keys"),
             known_hosts: dir.join("known_hosts"),
+            ssh_dir: dir.clone(),
             dir,
         }
     }
 
     pub fn client_key_candidates(&self) -> [PathBuf; 3] {
         [
-            self.dir.join("id_ed25519"),
-            self.dir.join("id_ecdsa"),
-            self.dir.join("id_rsa"),
+            self.ssh_dir.join("id_ed25519"),
+            self.ssh_dir.join("id_ecdsa"),
+            self.ssh_dir.join("id_rsa"),
         ]
     }
 
@@ -102,6 +115,13 @@ impl SshPublicKey {
         })
     }
 
+    /// Parses an OpenSSH public key line (`ssh-ed25519 AAAA... comment`).
+    pub fn from_openssh(line: &str) -> Result<Self> {
+        let public = ssh_key::PublicKey::from_openssh(line.trim())
+            .context("failed to parse an OpenSSH public key")?;
+        Self::from_ssh(public)
+    }
+
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
@@ -129,6 +149,62 @@ pub fn read_private_key(path: &Path) -> Result<ssh_key::PrivateKey> {
     check_private_key_permissions(path)?;
     ssh_key::PrivateKey::read_openssh_file(path)
         .with_context(|| format!("failed to read SSH private key {}", path.display()))
+}
+
+/// Generates a fresh, unencrypted Ed25519 key.
+pub fn generate_keypair() -> Result<ssh_key::PrivateKey> {
+    ssh_key::PrivateKey::random(&mut ssh_key::rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+        .context("failed to generate an Ed25519 key")
+}
+
+/// Writes an OpenSSH private key with owner-only permissions.
+///
+/// Refuses to replace an existing file and creates a missing parent directory
+/// (with mode 0700 on Unix) so a first run can populate `~/.config/cftp`.
+pub fn write_private_key(path: &Path, private: &ssh_key::PrivateKey) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+        restrict_dir(parent)?;
+    }
+    let pem = private
+        .to_openssh(ssh_key::LineEnding::LF)
+        .context("failed to encode SSH private key")?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create SSH private key {}", path.display()))?;
+    use std::io::Write as _;
+    file.write_all(pem.as_bytes())
+        .with_context(|| format!("failed to write SSH private key {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to flush SSH private key {}", path.display()))?;
+    Ok(())
+}
+
+/// Loads the host key at `path`, creating a new Ed25519 key on first use.
+///
+/// Returns the key and whether it was generated, so callers can tell the user
+/// where the new identity lives.
+pub fn load_or_create_host_key<F>(path: &Path, passphrase: F) -> Result<(SshPrivateKey, bool)>
+where
+    F: FnMut(&Path) -> Result<String>,
+{
+    if path.is_file() {
+        return Ok((load_private_key(path, passphrase)?, false));
+    }
+    let private = generate_keypair()?;
+    write_private_key(path, &private)?;
+    Ok((from_private_key(private)?, true))
 }
 
 pub fn load_private_key<F>(path: &Path, mut passphrase: F) -> Result<SshPrivateKey>
@@ -165,8 +241,7 @@ fn private_key_to_pkcs8(data: &KeypairData) -> Result<PrivateKeyDer<'static>> {
     let der = match data {
         KeypairData::Ed25519(key) => {
             let signing = ed25519_dalek::SigningKey::from(&key.private);
-            signing
-                .to_pkcs8_der()
+            ed25519_dalek::pkcs8::EncodePrivateKey::to_pkcs8_der(&signing)
                 .context("failed to encode Ed25519 key as PKCS#8")?
                 .as_bytes()
                 .to_vec()
@@ -190,7 +265,7 @@ fn private_key_to_pkcs8(data: &KeypairData) -> Result<PrivateKeyDer<'static>> {
             }
             rsa.precompute()
                 .context("failed to precompute RSA private key")?;
-            rsa.to_pkcs8_der()
+            rsa::pkcs8::EncodePrivateKey::to_pkcs8_der(&rsa)
                 .context("failed to encode RSA key as PKCS#8")?
                 .as_bytes()
                 .to_vec()
@@ -210,8 +285,7 @@ fn ecdsa_private_to_pkcs8(key: &EcdsaKeypair) -> Result<Vec<u8>> {
         EcdsaKeypair::NistP256 { .. } => {
             let secret = p256::SecretKey::from_slice(key.private_key_bytes())
                 .context("failed to convert ECDSA P-256 private key")?;
-            Ok(secret
-                .to_pkcs8_der()
+            Ok(p256::pkcs8::EncodePrivateKey::to_pkcs8_der(&secret)
                 .context("failed to encode ECDSA P-256 key as PKCS#8")?
                 .as_bytes()
                 .to_vec())
@@ -219,8 +293,7 @@ fn ecdsa_private_to_pkcs8(key: &EcdsaKeypair) -> Result<Vec<u8>> {
         EcdsaKeypair::NistP384 { .. } => {
             let secret = p384::SecretKey::from_slice(key.private_key_bytes())
                 .context("failed to convert ECDSA P-384 private key")?;
-            Ok(secret
-                .to_pkcs8_der()
+            Ok(p384::pkcs8::EncodePrivateKey::to_pkcs8_der(&secret)
                 .context("failed to encode ECDSA P-384 key as PKCS#8")?
                 .as_bytes()
                 .to_vec())
@@ -236,8 +309,7 @@ pub fn public_key_to_spki(public: &ssh_key::PublicKey) -> Result<Vec<u8>> {
         KeyData::Ed25519(key) => {
             let verifying = ed25519_dalek::VerifyingKey::from_bytes(&key.0)
                 .context("failed to convert Ed25519 public key")?;
-            verifying
-                .to_public_key_der()
+            ed25519_dalek::pkcs8::EncodePublicKey::to_public_key_der(&verifying)
                 .context("failed to encode Ed25519 public key as SPKI")?
                 .as_bytes()
                 .to_vec()
@@ -249,7 +321,7 @@ pub fn public_key_to_spki(public: &ssh_key::PublicKey) -> Result<Vec<u8>> {
             if rsa.size().saturating_mul(8) < 2048 {
                 bail!("RSA keys smaller than 2048 bits are not supported");
             }
-            rsa.to_public_key_der()
+            rsa::pkcs8::EncodePublicKey::to_public_key_der(&rsa)
                 .context("failed to encode RSA public key as SPKI")?
                 .as_bytes()
                 .to_vec()
@@ -267,8 +339,7 @@ fn ecdsa_public_to_spki(key: &EcdsaPublicKey) -> Result<Vec<u8>> {
         EcdsaPublicKey::NistP256(_) => {
             let public = p256::PublicKey::from_sec1_bytes(key.as_sec1_bytes())
                 .context("failed to convert ECDSA P-256 public key")?;
-            Ok(public
-                .to_public_key_der()
+            Ok(p256::pkcs8::EncodePublicKey::to_public_key_der(&public)
                 .context("failed to encode ECDSA P-256 public key as SPKI")?
                 .as_bytes()
                 .to_vec())
@@ -276,8 +347,7 @@ fn ecdsa_public_to_spki(key: &EcdsaPublicKey) -> Result<Vec<u8>> {
         EcdsaPublicKey::NistP384(_) => {
             let public = p384::PublicKey::from_sec1_bytes(key.as_sec1_bytes())
                 .context("failed to convert ECDSA P-384 public key")?;
-            Ok(public
-                .to_public_key_der()
+            Ok(p384::pkcs8::EncodePublicKey::to_public_key_der(&public)
                 .context("failed to encode ECDSA P-384 public key as SPKI")?
                 .as_bytes()
                 .to_vec())
@@ -309,5 +379,17 @@ fn check_private_key_permissions(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn check_private_key_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to restrict permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_dir(_path: &Path) -> Result<()> {
     Ok(())
 }

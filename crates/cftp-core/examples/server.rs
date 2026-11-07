@@ -4,9 +4,10 @@
 //! cargo run -p cftp-core --example server -- ./incoming 0.0.0.0:4433
 //! ```
 //!
-//! The server stays alive and accepts repeated transfers. It loads the host key
-//! and `authorized_keys` from `~/.ssh`. Encrypted host keys are rejected because
-//! this example has no passphrase prompt; use the CLI for those.
+//! The server stays alive and accepts repeated transfers. It uses (and creates
+//! on first run) the cftp host key in `~/.config/cftp` and reads
+//! `~/.ssh/authorized_keys`. Encrypted host keys are rejected because this
+//! example has no passphrase prompt; use the CLI for those.
 
 #![forbid(unsafe_code)]
 
@@ -15,10 +16,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use cftp_core::auth::load_server_auth;
+use cftp_core::auth::{ServerAuth, SshServerAuth};
 use cftp_core::progress::{ProgressEvent, ProgressSender};
-use cftp_core::ssh::SshPaths;
+use cftp_core::ssh::{SshPaths, load_or_create_host_key};
 use cftp_core::transfer::{ServeOptions, ServeStats, serve};
+use cftp_core::trust::AuthorizedKeys;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,12 +36,17 @@ async fn main() -> Result<()> {
         .context("listen address must be host:port")?;
 
     let ssh: SshPaths = SshPaths::user()?;
-    let auth = load_server_auth(&ssh.host_key, &ssh.authorized_keys, |path| {
+    let (host_key, created) = load_or_create_host_key(&ssh.host_key, |path| {
         bail!(
             "host key {} is encrypted; decrypt it or start the CLI for a prompt",
             path.display()
         )
     })?;
+    if created {
+        println!("generated host key {}", ssh.host_key.display());
+    }
+    let authorized_keys = AuthorizedKeys::load(&ssh.authorized_keys)?;
+    let auth: ServerAuth = ServerAuth::Ssh(SshServerAuth::new(host_key, authorized_keys));
 
     let (progress, mut events): (ProgressSender, _) = tokio::sync::mpsc::unbounded_channel();
     let progress_task = tokio::spawn(async move {

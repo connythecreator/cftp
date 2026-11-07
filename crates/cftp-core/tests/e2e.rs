@@ -561,6 +561,26 @@ async fn profiles_negotiate_and_server_caps_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aggressive_reader_pool_streams_a_multi_chunk_file() {
+    use cftp_core::tuning::HardwareProfile;
+
+    // Four chunks at the aggressive chunk size, claimed by several reader
+    // workers at once, so the file is read out of order and reassembled from
+    // the offsets in the chunk headers.
+    let size: usize = 16 * 1024 * 1024;
+    let (stats, received) = run_profile_transfer(
+        HardwareProfile::Aggressive,
+        HardwareProfile::Aggressive,
+        false,
+        None,
+        size,
+    )
+    .await;
+    assert_eq!(stats.effective_profile, HardwareProfile::Aggressive);
+    assert_eq!(received.len(), size);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forced_v2_ignores_profiles() {
     use cftp_core::tuning::HardwareProfile;
 

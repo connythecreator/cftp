@@ -5,8 +5,10 @@ use tokio::sync::Semaphore;
 
 use crate::link::compression_levels;
 
-pub const MAX_INFLIGHT_SENDS: usize = 128;
-pub const MAX_INFLIGHT_STREAMS: usize = 128;
+/// Backlog for encoded items waiting to be written to a data stream. This is a
+/// queue bound, not a transport limit: how many sends may actually be in
+/// flight is `Tuning::max_inflight_sends`.
+pub const ENCODED_QUEUE_CAPACITY: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tuning {
@@ -16,6 +18,12 @@ pub struct Tuning {
     pub pack_target: usize,
     pub pack_max_files: usize,
     pub small_file_max: u64,
+    /// Chunks fully read and waiting to be encoded. Peak read-ahead memory is
+    /// `readahead_chunks * chunk_size`, plus one in-flight buffer per reader
+    /// while it is blocked on a full queue.
+    pub readahead_chunks: usize,
+    /// Concurrent blocking readers used to fill the read-ahead queue.
+    pub read_workers: usize,
     pub chunk_zstd_level: i32,
     pub pack_zstd_level: i32,
     pub max_inflight_sends: usize,
@@ -53,6 +61,8 @@ impl Tuning {
                 pack_target: 1024 * 1024,
                 pack_max_files: 32,
                 small_file_max: 512 * 1024,
+                readahead_chunks: 1,
+                read_workers: 1,
                 chunk_zstd_level,
                 pack_zstd_level,
                 max_inflight_sends: 2,
@@ -67,10 +77,12 @@ impl Tuning {
             HardwareProfile::Default => Self {
                 profile,
                 encode_workers: cores,
-                chunk_size: 1024 * 1024,
+                chunk_size: 4 * 1024 * 1024,
                 pack_target: 4 * 1024 * 1024,
                 pack_max_files: 128,
                 small_file_max: 2 * 1024 * 1024,
+                readahead_chunks: 3,
+                read_workers: 3,
                 chunk_zstd_level,
                 pack_zstd_level,
                 max_inflight_sends: 32,
@@ -89,15 +101,17 @@ impl Tuning {
                 pack_target: 16 * 1024 * 1024,
                 pack_max_files: 256,
                 small_file_max: 4 * 1024 * 1024,
+                readahead_chunks: 8,
+                read_workers: 5,
                 chunk_zstd_level,
                 pack_zstd_level,
-                max_inflight_sends: MAX_INFLIGHT_SENDS,
-                max_inflight_streams: MAX_INFLIGHT_STREAMS,
-                max_concurrent_uni_streams: 256,
-                max_concurrent_bi_streams: 256,
-                receive_window: 256 * 1024 * 1024,
-                stream_receive_window: 64 * 1024 * 1024,
-                send_window: 256 * 1024 * 1024,
+                max_inflight_sends: 32,
+                max_inflight_streams: 32,
+                max_concurrent_uni_streams: 64,
+                max_concurrent_bi_streams: 64,
+                receive_window: 64 * 1024 * 1024,
+                stream_receive_window: 16 * 1024 * 1024,
+                send_window: 64 * 1024 * 1024,
                 socket_buffer: 8 * 1024 * 1024,
             },
         }
@@ -228,7 +242,7 @@ mod tests {
     #[test]
     fn default_profile_matches_existing_tuning() {
         let tuning: Tuning = Tuning::for_profile(HardwareProfile::Default, None);
-        assert_eq!(tuning.chunk_size, 1024 * 1024);
+        assert_eq!(tuning.chunk_size, 4 * 1024 * 1024);
         assert_eq!(tuning.pack_target, 4 * 1024 * 1024);
         assert_eq!(tuning.pack_max_files, 128);
         assert_eq!(tuning.small_file_max, 2 * 1024 * 1024);
@@ -248,6 +262,48 @@ mod tests {
         assert!(light.max_inflight_sends < aggressive.max_inflight_sends);
         assert!(light.receive_window < aggressive.receive_window);
         assert!(light.socket_buffer < aggressive.socket_buffer);
+    }
+
+    #[test]
+    fn read_pool_scales_with_profile() {
+        let light: Tuning = Tuning::for_profile(HardwareProfile::Light, None);
+        let default_profile: Tuning = Tuning::for_profile(HardwareProfile::Default, None);
+        let aggressive: Tuning = Tuning::for_profile(HardwareProfile::Aggressive, None);
+        assert_eq!(light.readahead_chunks, 1);
+        assert_eq!(default_profile.readahead_chunks, 3);
+        assert_eq!(aggressive.readahead_chunks, 8);
+        assert_eq!(light.read_workers, 1);
+        assert_eq!(default_profile.read_workers, 3);
+        assert_eq!(aggressive.read_workers, 5);
+        assert!(aggressive.readahead_chunks >= default_profile.readahead_chunks);
+        assert!(default_profile.readahead_chunks >= light.readahead_chunks);
+        assert!(aggressive.read_workers >= default_profile.read_workers);
+        assert!(default_profile.read_workers >= light.read_workers);
+    }
+
+    #[test]
+    fn aggressive_keeps_default_transport_limits() {
+        let default_profile: Tuning = Tuning::for_profile(HardwareProfile::Default, None);
+        let aggressive: Tuning = Tuning::for_profile(HardwareProfile::Aggressive, None);
+        // Oversized windows and more concurrent sends made the sender outrun
+        // the receiver on loopback, so aggressive spends its extra capacity on
+        // read-ahead and packing instead of on QUIC flow control.
+        assert_eq!(
+            aggressive.max_inflight_sends,
+            default_profile.max_inflight_sends
+        );
+        assert_eq!(
+            aggressive.max_inflight_streams,
+            default_profile.max_inflight_streams
+        );
+        assert_eq!(aggressive.receive_window, default_profile.receive_window);
+        assert_eq!(aggressive.send_window, default_profile.send_window);
+        assert_eq!(
+            aggressive.stream_receive_window,
+            default_profile.stream_receive_window
+        );
+        assert!(aggressive.read_workers > default_profile.read_workers);
+        assert!(aggressive.socket_buffer > default_profile.socket_buffer);
     }
 
     #[test]

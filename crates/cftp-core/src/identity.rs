@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +19,90 @@ use crate::congestion::AdaptiveCongestionConfig;
 use crate::tuning::Tuning;
 
 pub const DEFAULT_SERVER_NAME: &str = "cftp.local";
+
+/// Largest datagram used on a path known to carry jumbo frames.
+///
+/// A QUIC packet is capped at just under 16 KiB by its 14-bit length field,
+/// and 16,000 carries ten Ethernet-sized packets in one datagram.
+const LOOPBACK_DATAGRAM: u16 = 16_000;
+
+/// Bytes of UDP payload Linux accepts in one GSO buffer.
+const GSO_BUFFER_LIMIT: u32 = 64 * 1024;
+
+/// Datagram sizing for a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mtu {
+    /// Conservative assumption for arbitrary internet peers: quinn's defaults
+    /// (1,200-byte initial MTU, discovery up to Ethernet).
+    Ethernet,
+    /// The peer is known to be local (loopback), where the path MTU is 65,536
+    /// bytes. The connection starts at the jumbo datagram size instead of
+    /// waiting for path MTU discovery: a saturating transfer never leaves a
+    /// gap for the discovery probes, so a 1,200-byte MTU would otherwise be
+    /// used for the whole transfer.
+    Loopback,
+}
+
+impl Mtu {
+    /// Largest datagram this implementation accepts or sends.
+    pub(crate) const MAX_DATAGRAM: u16 = LOOPBACK_DATAGRAM;
+
+    pub(crate) fn max_udp_payload_size(self) -> u16 {
+        match self {
+            Self::Ethernet => 1500 - 28,
+            Self::Loopback => LOOPBACK_DATAGRAM,
+        }
+    }
+
+    fn initial_mtu(self) -> u16 {
+        match self {
+            Self::Ethernet => 1_200,
+            Self::Loopback => LOOPBACK_DATAGRAM,
+        }
+    }
+
+    /// Initial congestion window for this path.
+    ///
+    /// RFC 6928 starts at ten packets. With jumbo datagrams a ten-packet
+    /// window is larger than the 12 KiB default, and a window smaller than one
+    /// datagram would deadlock the handshake.
+    fn initial_window(self) -> u64 {
+        match self {
+            // quinn's default window; ten 1,200-byte packets.
+            Self::Ethernet => 10 * 1_200,
+            Self::Loopback => 10 * u64::from(self.max_udp_payload_size()),
+        }
+    }
+
+    /// How many datagrams may share one GSO send for this path.
+    ///
+    /// `None` leaves quinn's default in place. Jumbo datagrams need the batch
+    /// capped so a single `sendmsg` stays within the kernel's limit.
+    pub(crate) fn gso_segments(self) -> Option<usize> {
+        match self {
+            Self::Ethernet => None,
+            Self::Loopback => Some((GSO_BUFFER_LIMIT / u32::from(LOOPBACK_DATAGRAM)) as usize),
+        }
+    }
+
+    /// Datagram sizing for a connection to `peer`.
+    pub(crate) fn for_peer(peer: SocketAddr) -> Self {
+        if peer.ip().is_loopback() {
+            Self::Loopback
+        } else {
+            Self::Ethernet
+        }
+    }
+
+    /// Datagram sizing for an endpoint listening on `listen`.
+    ///
+    /// A loopback listener can only be reached from this host, where large
+    /// datagrams are safe. A wildcard or routable listener keeps the
+    /// conservative default because its peers are unknown.
+    pub(crate) fn for_listen(listen: SocketAddr) -> Self {
+        Self::for_peer(listen)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct IdentityPaths {
@@ -76,7 +161,12 @@ impl Identity {
         })
     }
 
-    pub fn server_config(&self, tuning: &Tuning, force_v2: bool) -> Result<quinn::ServerConfig> {
+    pub fn server_config(
+        &self,
+        tuning: &Tuning,
+        force_v2: bool,
+        mtu: Mtu,
+    ) -> Result<quinn::ServerConfig> {
         let mut roots = RootCertStore::empty();
         roots
             .add(self.ca.clone())
@@ -93,11 +183,16 @@ impl Identity {
 
         let quic = quinn::crypto::rustls::QuicServerConfig::try_from(config)?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic));
-        server.transport_config(Arc::new(transport_config(tuning)));
+        server.transport_config(Arc::new(transport_config(tuning, mtu)));
         Ok(server)
     }
 
-    pub fn client_config(&self, tuning: &Tuning, force_v2: bool) -> Result<quinn::ClientConfig> {
+    pub fn client_config(
+        &self,
+        tuning: &Tuning,
+        force_v2: bool,
+        mtu: Mtu,
+    ) -> Result<quinn::ClientConfig> {
         let mut roots = RootCertStore::empty();
         roots
             .add(self.ca.clone())
@@ -111,13 +206,20 @@ impl Identity {
 
         let quic = quinn::crypto::rustls::QuicClientConfig::try_from(config)?;
         let mut client = quinn::ClientConfig::new(Arc::new(quic));
-        client.transport_config(Arc::new(transport_config(tuning)));
+        client.transport_config(Arc::new(transport_config(tuning, mtu)));
         Ok(client)
     }
 }
 
-pub(crate) fn transport_config(tuning: &Tuning) -> quinn::TransportConfig {
+pub(crate) fn transport_config(tuning: &Tuning, mtu: Mtu) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
+    if mtu == Mtu::Loopback {
+        transport.initial_mtu(mtu.initial_mtu());
+        transport.min_mtu(mtu.initial_mtu());
+        let mut discovery = quinn::MtuDiscoveryConfig::default();
+        discovery.upper_bound(mtu.initial_mtu());
+        transport.mtu_discovery_config(Some(discovery));
+    }
     transport
         .max_concurrent_bidi_streams(quinn::VarInt::from_u32(tuning.max_concurrent_bi_streams));
     transport
@@ -131,7 +233,9 @@ pub(crate) fn transport_config(tuning: &Tuning) -> quinn::TransportConfig {
     transport.send_window(tuning.send_window);
     // Every path starts on CUBIC; the controller switches itself to BBR only
     // after measuring sustained loss (see `congestion.rs`).
-    transport.congestion_controller_factory(Arc::new(AdaptiveCongestionConfig));
+    transport.congestion_controller_factory(Arc::new(AdaptiveCongestionConfig {
+        initial_window: mtu.initial_window(),
+    }));
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
     transport.max_idle_timeout(Some(
         Duration::from_secs(60)
@@ -233,6 +337,22 @@ fn load_first_cert(path: &Path) -> Result<CertificateDer<'static>> {
 }
 
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)
+            .with_context(|| format!("failed to inspect private key {}", path.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            bail!(
+                "private key {} is readable by other users (mode {mode:04o}); run `chmod 600 {}`",
+                path.display(),
+                path.display()
+            );
+        }
+    }
     PrivateKeyDer::from_pem_file(path)
         .with_context(|| format!("failed to parse private key {}", path.display()))
 }
@@ -264,4 +384,44 @@ fn restrict_dir(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn restrict_dir(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_peers_use_large_datagrams() {
+        assert_eq!(
+            Mtu::for_peer("127.0.0.1:4433".parse().unwrap()),
+            Mtu::Loopback
+        );
+        assert_eq!(Mtu::for_peer("[::1]:4433".parse().unwrap()), Mtu::Loopback);
+        assert_eq!(
+            Mtu::for_peer("192.168.1.10:4433".parse().unwrap()),
+            Mtu::Ethernet
+        );
+        assert_eq!(
+            Mtu::for_listen("0.0.0.0:4433".parse().unwrap()),
+            Mtu::Ethernet
+        );
+        assert_eq!(
+            Mtu::for_listen("127.0.0.1:4433".parse().unwrap()),
+            Mtu::Loopback
+        );
+    }
+
+    #[test]
+    fn large_datagrams_stay_inside_the_gso_limit() {
+        // Linux rejects a UDP GSO buffer above 64 KiB, so the batch size has
+        // to shrink as the datagram grows.
+        let segments = Mtu::Loopback
+            .gso_segments()
+            .expect("loopback caps its batch");
+        assert!(segments > 1);
+        assert!(
+            u32::from(Mtu::Loopback.max_udp_payload_size()) * segments as u32 <= GSO_BUFFER_LIMIT
+        );
+        assert!(Mtu::Loopback.max_udp_payload_size() >= 1_200);
+    }
 }

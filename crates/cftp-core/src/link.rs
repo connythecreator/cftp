@@ -1,7 +1,44 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
 use cftp_proto::HardwareProfile;
+
+/// IPv4 addresses another machine on the network could use to reach this one.
+///
+/// Prefers the default-route interface so container bridges and VPN tunnels are
+/// not advertised; falls back to every non-loopback interface when there is no
+/// default route.
+pub fn lan_addresses() -> Vec<IpAddr> {
+    fn usable(interface: &netdev::Interface) -> Vec<IpAddr> {
+        interface
+            .ipv4
+            .iter()
+            .map(|net| net.addr())
+            .filter(|addr: &Ipv4Addr| {
+                !addr.is_loopback() && !addr.is_unspecified() && !addr.is_link_local()
+            })
+            .map(IpAddr::V4)
+            .collect()
+    }
+
+    let mut addresses: Vec<IpAddr> = Vec::new();
+    if let Ok(default) = netdev::get_default_interface()
+        && !default.is_loopback()
+    {
+        addresses.extend(usable(&default));
+    }
+    if addresses.is_empty() {
+        for interface in netdev::get_interfaces() {
+            if interface.is_loopback() {
+                continue;
+            }
+            addresses.extend(usable(&interface));
+        }
+    }
+    addresses.sort();
+    addresses.dedup();
+    addresses
+}
 
 pub fn detect_link_speed(peer: IpAddr) -> Option<u64> {
     if peer.is_loopback() {

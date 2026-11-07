@@ -690,3 +690,103 @@ fn serve_rejects_disabling_both_modes() {
         .assert()
         .failure();
 }
+
+#[test]
+fn scp_style_destinations_get_a_helpful_error() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("file.txt");
+    fs::write(&source, b"payload\n").unwrap();
+
+    cftp()
+        .arg("put")
+        .arg(&source)
+        .arg("host.example.com:/srv/files")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "cftp://host.example.com/srv/files",
+        ));
+}
+
+#[test]
+fn bootstrap_mode_creates_the_root_and_authorizes_the_supplied_key() {
+    use std::io::{BufRead, BufReader, Write};
+
+    use ssh_key::LineEnding;
+    use ssh_key::rand_core::OsRng;
+
+    let temp = tempdir().unwrap();
+    let server_key = temp.path().join("server_ed25519");
+    let client_key = temp.path().join("client_ed25519");
+    let server_private =
+        ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    let client_private =
+        ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+    server_private
+        .write_openssh_file(&server_key, LineEnding::LF)
+        .unwrap();
+    client_private
+        .write_openssh_file(&client_key, LineEnding::LF)
+        .unwrap();
+    let client_public = client_private.public_key().to_openssh().unwrap();
+    let server_public = server_private.public_key().to_openssh().unwrap();
+
+    // Deliberately missing: serve must create the root itself.
+    let destination = temp.path().join("dst");
+    let port = free_udp_port();
+    let mut server = Command::new(env!("CARGO_BIN_EXE_cftp"))
+        .args(["serve", "--root"])
+        .arg(&destination)
+        .args(["--listen", &format!("127.0.0.1:{port}")])
+        .arg("--host-key")
+        .arg(&server_key)
+        .arg("--bootstrap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    {
+        let mut stdin = server.stdin.take().unwrap();
+        writeln!(stdin, "{client_public}").unwrap();
+    }
+    let stdout = server.stdout.take().unwrap();
+    let mut lines = BufReader::new(stdout).lines();
+    let ready = lines
+        .next()
+        .expect("bootstrap server closed stdout without a ready line")
+        .unwrap();
+    let mut fields = ready.splitn(3, ' ');
+    assert_eq!(fields.next(), Some("CFTP-READY"), "ready line: {ready}");
+    let announced: u16 = fields.next().unwrap().parse().unwrap();
+    assert_eq!(announced, port);
+    assert_eq!(fields.next().unwrap(), server_public);
+
+    let source = temp.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("file.txt"), b"hello bootstrap\n").unwrap();
+    let known_hosts = temp.path().join("known_hosts");
+    let output = cftp()
+        .arg("put")
+        .arg(&source)
+        .arg(format!("cftp://127.0.0.1:{port}/incoming"))
+        .arg("--ssh-key")
+        .arg(&client_key)
+        .arg("--known-hosts")
+        .arg(&known_hosts)
+        .arg("--accept-new")
+        .arg("--quiet")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "bootstrap transfer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(destination.join("incoming/source/file.txt")).unwrap(),
+        b"hello bootstrap\n"
+    );
+    wait_for_exit(&mut server);
+}

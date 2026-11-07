@@ -7,7 +7,7 @@ ARCH_DIR := packaging/arch
 ARCH_TARBALL := $(ARCH_DIR)/cftp-$(VERSION).tar.gz
 DEB := target/debian/cftp_$(VERSION)-1_amd64.deb
 
-.PHONY: all assets release fmt fmt-check clippy test doc check lint deny typos markdownlint actionlint ci check-version deb bench arch-tarball arch-docker arch-chown arch-srcinfo verify-deb clean
+.PHONY: all assets release fmt fmt-check clippy test doc check lint deny typos markdownlint actionlint ci check-version deb bench bench-gate book arch-tarball arch-docker arch-chown arch-srcinfo verify-deb clean
 
 all: deb
 
@@ -37,7 +37,7 @@ typos:
 	typos
 
 markdownlint:
-	npx --yes markdownlint-cli2 "**/*.md"
+	npx --yes markdownlint-cli2 "**/*.md" "!bench/results/**"
 
 actionlint:
 	docker run --rm -v "$(CURDIR):/repo" -w /repo rhysd/actionlint:latest
@@ -61,6 +61,18 @@ release:
 bench:
 	cargo build --release -p cftp-cli --bin cftp
 	cargo run --release -p cftp-cli --example bench -- $(BENCH_ARGS)
+
+# Release gate: cftp vs scp/SFTP/HTTPS in one Docker container (FTP and HTTP are
+# measured as plaintext references). Fails when cftp is more than 5% slower than
+# the fastest security-equivalent peer, then publishes the results into
+# README.md and docs/wiki/Benchmarks.md.
+bench-gate:
+	./bench/gate.sh
+
+# Documentation site: stage docs/wiki plus the README, bench guide, and design
+# notes into an mdBook and render it to book/. Requires `mdbook` on PATH.
+book:
+	./scripts/build-book.sh
 
 deb: assets
 	cargo deb -p cftp-cli --locked

@@ -1,6 +1,6 @@
 # Maintainer: Conleth <103609099@student.swin.edu.au>
 pkgname=cftp
-pkgver=0.2.1
+pkgver=0.3.0
 pkgrel=1
 pkgdesc='QUIC-based file transfer with SSH-key authentication and optional mutual TLS'
 arch=('x86_64')
@@ -10,7 +10,7 @@ depends=('glibc' 'gcc-libs')
 optdepends=('bash-completion: bash completion'
             'fish: fish completion'
             'zsh: zsh completion')
-makedepends=('cargo' 'rust')
+makedepends=('cargo' 'gcc' 'rust')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 options=(!lto)

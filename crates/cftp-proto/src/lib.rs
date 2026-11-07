@@ -18,16 +18,22 @@ pub const PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_V4;
 /// This is deliberately far above any legitimate control message but low enough
 /// that a peer cannot make us allocate an arbitrary amount of memory by
 /// declaring a huge frame and then going silent.
-pub const MAX_CONTROL_FRAME: usize = 64 * 1024 * 1024;
+pub const MAX_CONTROL_FRAME: usize = 32 * 1024 * 1024;
 /// Upper bound for a single data header. Data headers only carry metadata, but a
 /// pack header may list many entries (`MAX_PACK_ENTRIES`).
 pub const MAX_DATA_HEADER: usize = 8 * 1024 * 1024;
-pub const MAX_DATA_PAYLOAD: usize = 64 * 1024 * 1024;
+/// Upper bound for one encoded or decoded data payload.
+///
+/// The aggressive profile's largest pack is 16 MiB, so 32 MiB leaves headroom
+/// while bounding both the encoded buffer and the decompressed output.
+pub const MAX_DATA_PAYLOAD: usize = 32 * 1024 * 1024;
 
 /// Maximum number of manifest entries accepted in a single transfer.
 pub const MAX_MANIFEST_ENTRIES: usize = 100_000;
 /// Maximum length of a relative path or symlink target in a manifest.
 pub const MAX_MANIFEST_PATH_LEN: usize = 4096;
+/// Maximum length of a push destination prefix.
+pub const MAX_DESTINATION_LEN: usize = 4096;
 /// Maximum declared size of a single file (1 TiB).
 pub const MAX_FILE_SIZE: u64 = 1 << 40;
 /// Maximum declared size of a whole transfer (16 TiB).

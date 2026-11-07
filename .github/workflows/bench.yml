@@ -1,0 +1,57 @@
+name: Benchmark gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, so a slow drift in a dependency is caught without a commit.
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: Release gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the benchmark gate
+        run: CFTP_BENCH_NO_PUBLISH=1 make bench-gate
+      - name: Publish results
+        # Only the main branch publishes; pull requests are read-only and only
+        # need the pass/fail verdict.
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          bench/update-readme.sh README.md bench/results/latest-fragment.md
+          cp bench/results/latest.md docs/wiki/Benchmarks.md
+          if git diff --quiet -- README.md docs/wiki/Benchmarks.md; then
+            echo "benchmark results are unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md docs/wiki/Benchmarks.md
+          git commit -m "Update benchmark results"
+          git push
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: benchmark-results
+          path: bench/results/
+          if-no-files-found: ignore

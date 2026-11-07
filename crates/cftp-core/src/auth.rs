@@ -10,7 +10,7 @@ use rustls::{
     ClientConfig, DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme,
 };
 
-use crate::identity::{Identity, alpn_protocols, transport_config};
+use crate::identity::{Identity, Mtu, alpn_protocols, transport_config};
 use crate::ssh::{SshPrivateKey, SshPublicKey};
 use crate::trust::{AuthorizedKeys, HostKeyStatus, KnownHostsStore, public_key_from_spki_checked};
 use crate::tuning::Tuning;
@@ -124,10 +124,15 @@ pub enum ServerAuth {
 }
 
 impl ServerAuth {
-    pub fn server_config(&self, tuning: &Tuning, force_v2: bool) -> Result<quinn::ServerConfig> {
+    pub fn server_config(
+        &self,
+        tuning: &Tuning,
+        force_v2: bool,
+        mtu: Mtu,
+    ) -> Result<quinn::ServerConfig> {
         match self {
-            Self::Cert(identity) => identity.server_config(tuning, force_v2),
-            Self::Ssh(auth) => ssh_server_config(auth, tuning, force_v2),
+            Self::Cert(identity) => identity.server_config(tuning, force_v2, mtu),
+            Self::Ssh(auth) => ssh_server_config(auth, tuning, force_v2, mtu),
         }
     }
 }
@@ -138,10 +143,15 @@ pub enum ClientAuth {
 }
 
 impl ClientAuth {
-    pub fn client_config(&self, tuning: &Tuning, force_v2: bool) -> Result<quinn::ClientConfig> {
+    pub fn client_config(
+        &self,
+        tuning: &Tuning,
+        force_v2: bool,
+        mtu: Mtu,
+    ) -> Result<quinn::ClientConfig> {
         match self {
-            Self::Cert(identity) => identity.client_config(tuning, force_v2),
-            Self::Ssh(auth) => ssh_client_config(auth, tuning, force_v2),
+            Self::Cert(identity) => identity.client_config(tuning, force_v2, mtu),
+            Self::Ssh(auth) => ssh_client_config(auth, tuning, force_v2, mtu),
         }
     }
 
@@ -169,6 +179,7 @@ fn ssh_server_config(
     auth: &SshServerAuth,
     tuning: &Tuning,
     force_v2: bool,
+    mtu: Mtu,
 ) -> Result<quinn::ServerConfig> {
     let provider: Arc<rustls::crypto::CryptoProvider> =
         Arc::new(rustls::crypto::ring::default_provider());
@@ -188,7 +199,7 @@ fn ssh_server_config(
     let quic: quinn::crypto::rustls::QuicServerConfig =
         quinn::crypto::rustls::QuicServerConfig::try_from(config)?;
     let mut server: quinn::ServerConfig = quinn::ServerConfig::with_crypto(Arc::new(quic));
-    server.transport_config(Arc::new(transport_config(tuning)));
+    server.transport_config(Arc::new(transport_config(tuning, mtu)));
     Ok(server)
 }
 
@@ -196,6 +207,7 @@ fn ssh_client_config(
     auth: &SshClientAuth,
     tuning: &Tuning,
     force_v2: bool,
+    mtu: Mtu,
 ) -> Result<quinn::ClientConfig> {
     let provider: Arc<rustls::crypto::CryptoProvider> =
         Arc::new(rustls::crypto::ring::default_provider());
@@ -220,7 +232,7 @@ fn ssh_client_config(
     let quic: quinn::crypto::rustls::QuicClientConfig =
         quinn::crypto::rustls::QuicClientConfig::try_from(config)?;
     let mut client: quinn::ClientConfig = quinn::ClientConfig::new(Arc::new(quic));
-    client.transport_config(Arc::new(transport_config(tuning)));
+    client.transport_config(Arc::new(transport_config(tuning, mtu)));
     Ok(client)
 }
 
@@ -238,6 +250,16 @@ impl std::fmt::Debug for SshClientCertVerifier {
             )
             .finish_non_exhaustive()
     }
+}
+
+/// Error returned by the TLS 1.2 signature hooks of the raw-public-key
+/// verifiers. QUIC never negotiates TLS 1.2, but the trait requires the methods
+/// and they must not silently accept a signature verified against the wrong
+/// transcript.
+fn tls12_unsupported() -> rustls::Error {
+    rustls::Error::General(
+        "cftp requires TLS 1.3 (QUIC); a TLS 1.2 signature is not acceptable".to_string(),
+    )
 }
 
 impl ClientCertVerifier for SshClientCertVerifier {
@@ -262,16 +284,14 @@ impl ClientCertVerifier for SshClientCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature_with_raw_key(
-            message,
-            &SubjectPublicKeyInfoDer::from(cert.as_ref()),
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        // QUIC is TLS 1.3 only. A TLS 1.2 handshake signs a different transcript
+        // (the ServerKeyExchange/ClientKeyExchange), so running the TLS 1.3
+        // verifier here would check the wrong bytes; refuse instead.
+        Err(tls12_unsupported())
     }
 
     fn verify_tls13_signature(
@@ -385,16 +405,14 @@ impl ServerCertVerifier for SshServerCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature_with_raw_key(
-            message,
-            &SubjectPublicKeyInfoDer::from(cert.as_ref()),
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        // QUIC is TLS 1.3 only. A TLS 1.2 handshake signs a different transcript
+        // (the ServerKeyExchange/ClientKeyExchange), so running the TLS 1.3
+        // verifier here would check the wrong bytes; refuse instead.
+        Err(tls12_unsupported())
     }
 
     fn verify_tls13_signature(

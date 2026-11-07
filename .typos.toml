@@ -12,3 +12,6 @@ quinn = "quinn"
 postcard = "postcard"
 rustls = "rustls"
 Connys = "Connys"
+# vsftpd's directive is spelled `allow_writeable_chroot`; the upstream name is
+# what the benchmark container has to configure.
+writeable = "writeable"

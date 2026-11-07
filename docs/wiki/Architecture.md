@@ -11,6 +11,13 @@ transfer logic lives in the library crates.
 
 Every crate root has `#![forbid(unsafe_code)]`.
 
+The engine is a module tree rather than one file: `transfer/client.rs` (shared
+connection setup), `push.rs`, `pull.rs`, `produce.rs`, `send.rs`, `server.rs`,
+`receive.rs` (control loop and manifest checks), `receiver.rs` (stream decoding
+and writes), and `pull_server.rs` split the transfer by role, while
+`transfer/options.rs` holds the request and statistics types. [The full design notes](../architecture.md) include a system map and
+function-level push, pull, and pipeline diagrams.
+
 ## Transfer flow (push)
 
 1. The client scans the source (`scan_source`) and assigns each entry a dense

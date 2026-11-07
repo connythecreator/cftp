@@ -4,9 +4,11 @@
 
 - Rust 1.88 or newer to build from source. Prebuilt Linux packages are
   available for Debian/Ubuntu and Arch.
-- An SSH key pair. The receiver needs the sender's public key in
-  `~/.ssh/authorized_keys`; the sender pins the receiver's host key in
-  `~/.ssh/known_hosts`.
+- An SSH key pair. `cftp keygen` creates one if `~/.ssh` has none. The receiver
+  needs the sender's public key in `~/.ssh/authorized_keys`, or you can use
+  `--via-ssh`, which authorizes the sender for a single session.
+- The sender pins the receiver's host key in `~/.config/cftp/known_hosts`;
+  `serve` generates `~/.config/cftp/host_key` on first run.
 - UDP reachability. The default port is `4433`, not TCP.
 - Linux, macOS, or Windows source builds. Symlink transfer is Unix-only.
 
@@ -27,24 +29,39 @@ See [packaging](../packaging.md) for building the packages yourself.
 
 ## First transfer
 
-On the receiver:
+If you can already `ssh` from the sender to the receiver, one command starts a
+temporary one-shot server there, learns its host key over the authenticated SSH
+channel, and authorizes your client key for that session only:
 
 ```bash
-cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
-cftp serve --root ./incoming
+cftp put ./project project --via-ssh you@receiver
 ```
 
-On the sender:
+The destination is relative to the SSH login's home directory (a leading slash
+is ignored). UDP `4433` (or the port after the host) must still be reachable
+directly; SSH is only the bootstrap.
+
+For a permanent receiver, authorize the sender once and start the listener:
 
 ```bash
+# On the sender: print the public key to authorize on the receiver.
+cftp pubkey
+
+# On the receiver: paste that line into ~/.ssh/authorized_keys, then start
+# the listener (the root and host key are created on first run).
+cftp serve --root ~/incoming
+
+# On the sender:
 cftp put ./project/ cftp://receiver:4433/project
 ```
+
+`cftp keygen` creates a key if the sender has none.
 
 The first connection prints the receiver's host-key fingerprint and asks for
 confirmation, like `ssh`/`scp`. In scripts, pass `--accept-new` to add an unknown
 key without prompting. A *changed* key always fails.
 
-The receiver writes the tree under `./incoming/project/`. `serve` keeps running
+The receiver writes the tree under `~/incoming/project/`. `serve` keeps running
 and accepts more transfers, up to four concurrently; extra clients wait for a
 slot. `--max-sessions N` changes the bound. Use `--one-shot` when a wrapper
 expects a single session.
@@ -63,6 +80,10 @@ message before any data moves.
 
 - A destination containing `://` is remote. Only `cftp://host[:port]/path` is
   accepted; any other scheme is an error.
+- scp-style `host:path` destinations are rejected with a hint pointing at
+  `cftp://host/path` or `--via-ssh host:/path`.
+- With `--via-ssh`, a plain path argument is the remote destination (relative
+  to the remote home directory) instead of a local copy.
 - Anything else is a local copy, performed without the network.
 - A trailing slash on a directory source transfers its contents; without it the
   directory name is preserved. `get` applies the same rule to the remote source.
@@ -150,13 +171,21 @@ server name is `cftp.local`.
 ## Benchmarks
 
 ```bash
-make bench BENCH_ARGS="--quick"
+make bench BENCH_ARGS="--quick"   # local smoke run
+make bench-gate                   # release gate in Docker
 ```
 
-The harness in `crates/cftp-cli/examples/bench.rs` generates small-file, large-file,
-and mixed datasets, transfers them over loopback, and compares against local copy
-baselines. `scp`, FTP, and HTTP run only when their tools and targets are
-available or supplied. See [the benchmark guide](../../bench/README.md).
+The harness in `crates/cftp-cli/examples/bench/` generates small-file, large-file,
+mixed, and 1 GiB `huge` datasets, transfers them over loopback, and compares
+against local copy baselines. It runs cftp with `--aggressive`. `scp`, SFTP,
+HTTPS, FTP, and HTTP run only when their tools and targets are available or
+supplied. `make bench-gate` runs every peer in one Docker container and fails
+unless cftp is within 5 % of the fastest encrypted peer (scp, SFTP, HTTPS); FTP
+and HTTP are plaintext reference rows. The gate includes the 1 GiB `huge`
+dataset and deletes each upload after measuring it, so it holds one generated
+dataset plus one copy rather than one copy per peer. Published results are on
+[the benchmark page](Benchmarks.md). See also
+[the benchmark guide](../../bench/README.md).
 
 ## Next
 

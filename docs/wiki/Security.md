@@ -4,20 +4,27 @@
 
 - SSH keys are used as TLS raw public keys over QUIC. cftp does not implement
   the SSH transport.
-- The server loads a host key (default `~/.ssh/id_ed25519`) and checks client
-  keys against `authorized_keys`.
+- The server loads a host key (default `~/.config/cftp/host_key`, generated on
+  first run) and checks client keys against `authorized_keys`.
 - The client loads `~/.ssh/id_ed25519`, `id_ecdsa`, or `id_rsa`, and pins the
-  server in `known_hosts`. Wildcards, port entries, hashed entries, and
-  `@revoked` markers are supported.
+  server in `~/.config/cftp/known_hosts`. Wildcards, port entries, hashed
+  entries, and `@revoked` markers are supported. A bare host pattern covers port
+  22; every other port is written as `[host]:port`.
 - Unknown host keys prompt for confirmation or are added with `--accept-new`.
   A changed key always fails.
-- `authorized_keys` options cftp cannot enforce (such as `from=` and
-  `command=`) are ignored with a warning.
+- `authorized_keys` entries with any option cftp cannot enforce (such as
+  `from=` and `command=`) are rejected, not silently ignored. Only
+  restriction-only flags such as `no-pty` and `restrict` are accepted.
+- `--via-ssh` derives trust from the SSH login: the remote host key is learned
+  over the authenticated SSH channel and pinned for the session, and the local
+  client key is authorized only for that one-shot server.
 - SSH certificates and `ssh-agent` are not supported.
 
 Certificate mode (`--auth cert`) uses mutual TLS with a shared local CA. Both
 peers must trust the same `ca.pem`; the leaf certificate is used for client and
-server authentication.
+server authentication. The CA is the identity in this mode, because any
+certificate it signed is accepted, so treat a `ca.pem` from an untrusted party
+as a credential leak.
 
 ## Path safety
 

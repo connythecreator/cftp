@@ -105,6 +105,17 @@ jobs:
       - uses: actions/checkout@v7
       - uses: raven-actions/actionlint@v2
 
+  book:
+    name: Documentation site
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: latest
+      - run: make book
+
   package:
     name: Package
     runs-on: ubuntu-latest

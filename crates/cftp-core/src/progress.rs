@@ -22,3 +22,16 @@ pub enum ProgressEvent {
 }
 
 pub type ProgressSender = tokio::sync::mpsc::UnboundedSender<ProgressEvent>;
+
+/// Creates a progress channel for [`crate::transfer::push`],
+/// [`crate::transfer::pull`], or [`crate::transfer::serve`].
+///
+/// Keep the receiver alive until the transfer future completes. The sender is
+/// unbounded and never blocks the engine; sending to a dropped receiver is a
+/// no-op, so a slow or absent UI cannot stall a transfer.
+pub fn channel() -> (
+    ProgressSender,
+    tokio::sync::mpsc::UnboundedReceiver<ProgressEvent>,
+) {
+    tokio::sync::mpsc::unbounded_channel()
+}

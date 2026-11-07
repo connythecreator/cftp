@@ -7,6 +7,118 @@ cftp is split into three crates:
   authentication, and the transfer engine.
 - `cftp-cli` provides the `cftp` binary.
 
+## System map
+
+```text
+cftp-cli
+  main.rs ................ parse argv, dispatch
+  commands/serve.rs ...... listen, print URLs, stay alive
+  commands/put.rs ........ build PushOptions, render progress
+  commands/get.rs ........ build PullOptions, render progress
+  commands/identity.rs ... keygen, pubkey, identity init
+  commands/remote.rs ..... cftp:// and --via-ssh parsing, SSH bootstrap
+  commands/progress.rs ... indicatif progress bar and rates
+        │
+        │ push / pull / serve  (cftp-core::prelude)
+        ▼
+cftp-core
+  transfer/mod.rs ........ public API, shared constants, re-exports
+  transfer/options.rs .... PushOptions, PullOptions, stats
+  transfer/client.rs ..... connect_client, validate_tuning
+  transfer/push.rs ....... push: scan → encode → send → report
+  transfer/pull.rs ....... pull: validate manifest → fetch → write
+  transfer/produce.rs .... scan → packs/chunks → encoded queue
+  transfer/send.rs ....... EncodedItem → QUIC unidirectional streams
+  transfer/server.rs ..... serve, accept loop, serve_connection
+  transfer/receive.rs .... receive_connection, spawn_receive_task, manifest checks
+  transfer/receiver.rs ... decode_stream → ReceiverState → write_at
+  transfer/pull_server.rs  serve_pull: resolve → scan → manifest → send
+  scan.rs path.rs codec.rs  filesystem walk, path safety, zstd/BLAKE3
+  auth.rs identity.rs ssh.rs trust.rs  authentication backends
+  tuning.rs link.rs congestion.rs socket.rs  profiles and transport
+        │
+        │ postcard control frames, raw data payloads
+        ▼
+cftp-proto ................ wire types, framing, ALPN, size limits
+```
+
+Each transfer is one QUIC connection: the client opens a bidirectional control
+stream, then sends data on many unidirectional streams. The same
+`produce_items`/`send_item` pipeline serves a push client and a pull server, and
+the same `decode_stream`/`ReceiverState` pipeline serves a push server and a
+pull client.
+
+## Push: function-level flow
+
+```text
+CLIENT                                          SERVER
+push()                                          serve()
+ ├─ scan_source()                               └─ accept_connection()
+ ├─ connect_client()                              └─ serve_connection()
+ │   └─ QUIC handshake + SSH/RPK auth               ├─ read_client_hello()
+ ├─ write_client_hello()                            ├─ ServePolicy check
+ ├─ read_server_hello()                             ├─ validate_manifest()
+ ├─ produce_items()                                 ├─ create tree
+ │   ├─ build_pack()          small files           │   (spawn_blocking)
+ │   ├─ enqueue_large()       large files           ├─ write_server_hello()
+ │   │   ├─ reserve_chunk()                         └─ receive_connection()
+ │   │   └─ read_worker() → read_at()                   ├─ spawn_receive_task() × N
+ │   │       └─ bounded read-ahead queue                │   ├─ decode_stream()
+ │   └─ codec::compress() + BLAKE3 (blocking)           │   └─ ReceiverState::
+ ├─ send_item() × max_inflight_sends                    │       apply_pack/apply_chunk
+ │   └─ open_uni() + DataHeader + payload               ├─ write_at(): temp file + rename
+ ├─ read_server_message() ← Progress telemetry          ├─ write_server_progress() (timer)
+ └─ write_complete() ───────────────────────────────►   ├─ drain streams, verify hashes
+                                                        └─ write_server_done() → Done
+```
+
+## Pull: function-level flow
+
+```text
+CLIENT                                          SERVER
+pull()                                          serve()
+ ├─ connect_client()                            └─ serve_connection()
+ ├─ write_client_hello(Pull, source)               ├─ read_client_hello()
+ ├─ read_server_hello()                            ├─ ServePolicy check
+ ├─ read_server_manifest()                         ├─ path::resolve_read_path()
+ ├─ validate_manifest()                            ├─ scan_source()
+ ├─ create tree (spawn_blocking)                   ├─ write_server_manifest()
+ ├─ write_client_ready() ───────────────────────►  ├─ read_client_ready()
+ └─ receive loop (same state machine as a server)  └─ serve_pull()
+     ├─ spawn_receive_task() × N                      ├─ produce_items()
+     │   ├─ decode_stream()                           ├─ send_item()
+     │   └─ ReceiverState + write_at()                ├─ write_server_progress()
+     └─ write_complete() ────────────────────────►    └─ write_server_done() → Done
+```
+
+## Data pipeline
+
+```text
+large file
+  shared AtomicU64 offset cursor
+    ├─ read_worker 0 ─┐
+    ├─ read_worker 1 ─┤ positioned reads (read_at)
+    └─ read_worker N ─┘      N = 1 / 3 / 5 for light / default / aggressive
+          │
+          ▼  bounded queue: readahead_chunks
+   encode permit (encode_workers)
+          │
+          ▼  spawn_blocking: BLAKE3 hash + zstd
+   EncodedItem::Chunk { offset, payload }
+          │
+          ▼  bounded encoded queue: ENCODED_QUEUE_CAPACITY
+   send_item() → one QUIC unidirectional stream per chunk
+          │
+          ▼
+   decode_stream() → verify hash → decompress
+          │
+          ▼
+   ReceivedRanges: accept out-of-order, reject overlaps
+          │
+          ▼
+   write_at(offset) into a temporary file; rename after verification
+```
+
 ## Transfer flow: push
 
 1. The client scans the source, assigns each entry an id, and sends a
@@ -79,7 +191,13 @@ rejected before any scan, path resolution, or file creation.
 ## Hardware profiles and hotswapping
 
 - `light`, `default`, and `aggressive` presets control worker threads, chunk
-  and pack sizes, zstd levels, in-flight work, stream limits, and QUIC windows.
+  and pack sizes, zstd levels, read-ahead depth, and the UDP socket buffer.
+- `default` and `aggressive` share the same QUIC windows, stream limits, and
+  in-flight send bounds. Allowing 256 MiB windows and 128 concurrent sends made
+  the sender outrun the receiver's socket buffer on loopback; the resulting
+  retransmissions and window collapses made a 1 GiB transfer about a quarter
+  slower. Aggressive spends its extra capacity on read-ahead, packing, and a
+  larger socket buffer instead.
 - The client requests a profile. The server has a fixed cap configured at
   startup and may accept or reject each request. Rejections leave the current
   profile unchanged and do not abort the transfer.
@@ -116,6 +234,24 @@ rejected before any scan, path resolution, or file creation.
   changes only the QUIC congestion controller; zstd and the wire format are
   untouched.
 
+## Datagram size and GSO
+
+- A connection to a loopback peer starts at 16 KB QUIC datagrams (the largest
+  that fits the 14-bit packet-length field) instead of quinn's 1,200-byte
+  initial MTU. Path MTU discovery has no gap to probe on a saturated transfer,
+  so the default would otherwise be used for the whole transfer. A wildcard or
+  routable listener keeps quinn's conservative defaults, because its peers are
+  unknown.
+- Every endpoint advertises 16 KB as its maximum receive size, so a loopback
+  client talking to a wildcard server still uses large datagrams.
+- Linux rejects a UDP GSO buffer above 64 KiB. Quinn packs up to ten datagrams
+  per `sendmsg`, so `socket.rs` wraps the socket in `CappedGsoSocket` and caps
+  `max_transmit_segments()` at what the 64 KiB limit allows for the current
+  datagram size.
+- The initial congestion window scales with the datagram size. CUBIC's 12 KB
+  default is smaller than one jumbo Initial packet, and a connection that
+  cannot send its first packet never gets past the handshake.
+
 ## Packing and chunking
 
 - Files at or below `--small-file-max` are packed together.
@@ -136,6 +272,24 @@ rejected before any scan, path resolution, or file creation.
   blocks incoming stream handoff.
 - Throughput can still be limited by the network, disk, or QUIC flow control
   rather than CPU count.
+
+## Large-file send pipeline
+
+A large file moves through a reader pool, a compression stage, and the ordered
+send pipeline:
+
+- A pool of reader workers claims chunks from a shared offset cursor and fetches
+  them with positioned reads, so reads for one file proceed in parallel.
+- Readers fill a bounded queue that the hash/compress workers drain; encoding
+  concurrency is still bounded by `encode_workers`.
+- Each chunk is hashed and compressed on `spawn_blocking`, then sent on a data
+  stream. Chunks carry explicit offsets, so they can complete out of order.
+
+The reader pool scales with the profile: 1 worker on Light, 3 on Default, and 5
+on Aggressive. The queue is bounded, so the disk can run ahead of encoding
+without unbounded buffering. Extra memory per large file is bounded at the queue
+depth plus one in-flight buffer per reader, times `--chunk-size` (about 52 MiB
+at Aggressive), and the bounded send pipeline and wire format are unchanged.
 
 ## Liveness and timeouts
 
@@ -179,8 +333,8 @@ SSH authentication is the default. cftp does not speak the SSH transport; it
 uses SSH keys as TLS raw public keys over QUIC:
 
 - The client loads `~/.ssh/id_ed25519`, `id_ecdsa`, or `id_rsa`.
-- The server loads its host key (default `~/.ssh/id_ed25519`) and
-  `~/.ssh/authorized_keys`.
+- The server loads its host key (default `~/.config/cftp/host_key`, generated on
+  first run) and verifies clients against `~/.ssh/authorized_keys`.
 - Each key is normalized to PKCS#8 for signing and to a SubjectPublicKeyInfo
   (SPKI) for identification.
 - Custom rustls verifiers compare the peer's SPKI against `authorized_keys` or
@@ -189,9 +343,13 @@ uses SSH keys as TLS raw public keys over QUIC:
 - Unknown host keys prompt for confirmation, or are added with `--accept-new`.
   A changed host key always fails.
 - `known_hosts` wildcards, port entries, hashed entries, and `@revoked` markers
-  are supported. SSH certificates and `ssh-agent` are not.
-- `authorized_keys` entries with security-relevant options that cftp cannot
-  enforce, such as `from=` and `command=`, are ignored with a warning.
+  are supported. Port semantics follow OpenSSH: a bare host pattern covers port
+  22, and other ports use `[host]:port`. cftp writes its own entries bracketed,
+  under `~/.config/cftp/known_hosts`. SSH certificates and `ssh-agent` are not
+  supported.
+- `authorized_keys` entries carrying any option cftp cannot enforce, such as
+  `from=` and `command=`, are rejected. Only restriction-only flags such as
+  `no-pty` and `restrict` are accepted.
 
 Certificate mode remains available with `--auth cert`. It uses mutual TLS with a
 shared local CA, as before.
@@ -216,7 +374,7 @@ To report a vulnerability, see [the security policy](../.github/SECURITY.md).
 
 ## Benchmarks
 
-`crates/cftp-cli/examples/bench.rs` is a self-contained harness for measuring
+`crates/cftp-cli/examples/bench/` is a self-contained harness for measuring
 cftp against local and optional external baselines. It generates small-file,
 large-file, and mixed datasets, transfers them over loopback with mutual TLS,
 verifies the received bytes, and reports wall time and throughput. Recursive
@@ -238,8 +396,9 @@ make bench BENCH_ARGS="--quick"
   the legacy default tuning.
 - Pull requires `cftp/4` on both peers. There is no pull fallback.
 - A pull is not resumable yet; an interrupted pull restarts.
-- Aggressive mode can consume hundreds of MiB because it increases in-flight
-  data and QUIC windows.
+- Aggressive mode reads up to eight chunks per large file ahead of the encoders
+  (about 52 MiB) and builds larger packs, so it needs more memory than the
+  default profile.
 - Transfers are not resumed across sessions; interrupted transfers restart.
 - `ssh-agent` and SSH certificate authentication are not supported yet.
 - Filenames must be valid UTF-8. On Unix, filenames containing backslashes are

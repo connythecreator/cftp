@@ -11,12 +11,29 @@ fn generate(algorithm: ssh_key::Algorithm) -> ssh_key::PrivateKey {
     ssh_key::PrivateKey::random(&mut OsRng, algorithm).unwrap()
 }
 
+/// A throwaway ECDSA P-256 key embedded only so tests can exercise parsing.
+/// `ssh-key` cannot generate ECDSA keys without the `p256` feature, which pulls
+/// the advisory-affected `crypto-bigint 0.5`; parsing works with `ecdsa` alone.
+const ECDSA_FIXTURE: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS
+1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQTsc7f7GpqAFGlVJKRScg4q6XPwQrkB
+CL/WWn+S4eJkczp4pL18hJC1+7uOaVl0/jnDRC48JiM7UzWjGkJt0pF4AAAAsLu0LEW7tC
+xFAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOxzt/samoAUaVUk
+pFJyDirpc/BCuQEIv9Zaf5Lh4mRzOnikvXyEkLX7u45pWXT+OcNELjwmIztTNaMaQm3SkX
+gAAAAgKMPgW30dX7weZHjAig6EPbHYGXha0FhaaX8c//OD4GEAAAARY2Z0cC10ZXN0LWZp
+eHR1cmUBAgMEBQYH
+-----END OPENSSH PRIVATE KEY-----
+";
+
+fn fixture_ecdsa() -> ssh_key::PrivateKey {
+    ssh_key::PrivateKey::from_openssh(ECDSA_FIXTURE).unwrap()
+}
+
 #[test]
 fn converts_common_ssh_key_types_to_spki() {
     let ed25519 = generate(ssh_key::Algorithm::Ed25519);
-    let ecdsa = generate(ssh_key::Algorithm::Ecdsa {
-        curve: ssh_key::EcdsaCurve::NistP256,
-    });
+    let ecdsa = fixture_ecdsa();
     let rsa = generate(ssh_key::Algorithm::Rsa { hash: None });
 
     for private in [ed25519, ecdsa, rsa] {
@@ -75,7 +92,10 @@ fn known_hosts_matches_wildcards_and_ports() {
     let path = temp.path().join("known_hosts");
     fs::write(
         &path,
-        format!("*.example.com {}\n", public.public_openssh().unwrap()),
+        format!(
+            "[*.example.com]:4433 {}\n",
+            public.public_openssh().unwrap()
+        ),
     )
     .unwrap();
 
@@ -103,6 +123,32 @@ fn known_hosts_matches_wildcards_and_ports() {
     assert_eq!(
         store.status("example.com", 4444, public.spki()),
         HostKeyStatus::Trusted
+    );
+}
+
+#[test]
+fn a_bare_known_hosts_entry_only_covers_port_22() {
+    // OpenSSH semantics: `host` in known_hosts means `host:22`, not cftp's
+    // default port. Sharing a file with OpenSSH must not make an sshd host key
+    // count as a cftp pin on another port.
+    let temp = tempdir().unwrap();
+    let private = generate(ssh_key::Algorithm::Ed25519);
+    let public = SshPublicKey::from_ssh(private.public_key().clone()).unwrap();
+    let path = temp.path().join("known_hosts");
+    fs::write(
+        &path,
+        format!("example.com {}\n", public.public_openssh().unwrap()),
+    )
+    .unwrap();
+
+    let store = KnownHostsStore::load(&path).unwrap();
+    assert_eq!(
+        store.status("example.com", 22, public.spki()),
+        HostKeyStatus::Trusted
+    );
+    assert_eq!(
+        store.status("example.com", 4433, public.spki()),
+        HostKeyStatus::Unknown
     );
 }
 

@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use hmac::{Hmac, Mac};
-use rsa::pkcs8::DecodePublicKey;
 use rsa::traits::PublicKeyParts;
 use sha1::Sha1;
 use ssh_key::known_hosts::{HostPatterns, KnownHosts, Marker};
@@ -15,7 +14,11 @@ use crate::ssh::{SshPublicKey, public_key_to_spki};
 
 type HmacSha1 = Hmac<Sha1>;
 
-pub const DEFAULT_KH_PORT: u16 = 4433;
+/// Port that a bare known_hosts pattern (for example `example.com` rather than
+/// `[example.com]:4433`) refers to, following OpenSSH. cftp's own default port is
+/// 4433, so its entries are always written in the bracket form; that keeps a
+/// file shared with OpenSSH from matching an sshd host key on the wrong port.
+pub const SSH_DEFAULT_PORT: u16 = 22;
 
 #[derive(Debug)]
 pub struct AuthorizedKeys {
@@ -79,10 +82,31 @@ impl AuthorizedKeys {
         self.keys.iter().any(|key| key.spki() == spki)
     }
 
+    /// A set holding exactly one key. Used by the SSH bootstrap flow, where the
+    /// client's key arrives over the authenticated SSH channel instead of from
+    /// `authorized_keys`.
+    pub fn single(key: SshPublicKey) -> Self {
+        Self { keys: vec![key] }
+    }
+
     pub fn fingerprints(&self) -> impl Iterator<Item = &str> {
         self.keys.iter().map(SshPublicKey::fingerprint)
     }
 }
+
+/// authorized_keys options that only ever restrict a key further. cftp does not
+/// offer any of the features they disable, so ignoring them cannot grant more
+/// access than an unadorned key. Every other option (including unknown ones and
+/// `@`-prefixed markers such as `@cert-authority`) is rejected: an entry whose
+/// restrictions cftp cannot enforce must not authenticate.
+const HARMLESS_AUTHORIZED_KEY_OPTIONS: &[&str] = &[
+    "restrict",
+    "no-agent-forwarding",
+    "no-port-forwarding",
+    "no-pty",
+    "no-user-rc",
+    "no-x11-forwarding",
+];
 
 fn unsupported_authorized_key_option<'a>(
     options: impl Iterator<Item = &'a str>,
@@ -94,17 +118,7 @@ fn unsupported_authorized_key_option<'a>(
             .unwrap_or(option)
             .trim()
             .to_ascii_lowercase();
-        matches!(
-            name.as_str(),
-            "command"
-                | "from"
-                | "environment"
-                | "expiry-time"
-                | "permitopen"
-                | "permitlisten"
-                | "principals"
-                | "tunnel"
-        )
+        !HARMLESS_AUTHORIZED_KEY_OPTIONS.contains(&name.as_str())
     })
 }
 
@@ -256,7 +270,7 @@ impl KnownHostsStore {
 }
 
 pub fn canonical_host(host: &str, port: u16) -> String {
-    if port == DEFAULT_KH_PORT {
+    if port == SSH_DEFAULT_PORT {
         host.to_string()
     } else {
         format!("[{host}]:{port}")
@@ -284,11 +298,6 @@ fn host_matches(patterns: &HostPatterns, host: &str, port: u16) -> bool {
                 Err(_) => return false,
             };
             mac.update(canonical_host(host, port).as_bytes());
-            if mac.verify_slice(hash).is_ok() {
-                return true;
-            }
-            let mut mac = HmacSha1::new_from_slice(salt).expect("HMAC accepts any key size");
-            mac.update(host.as_bytes());
             mac.verify_slice(hash).is_ok()
         }
     }
@@ -305,7 +314,7 @@ fn pattern_matches_host(pattern: &str, host: &str, port: u16) -> bool {
         return pattern_port == port && glob_match(pattern_host, host);
     }
 
-    port == DEFAULT_KH_PORT && glob_match(pattern, host)
+    port == SSH_DEFAULT_PORT && glob_match(pattern, host)
 }
 
 fn glob_match(pattern: &str, value: &str) -> bool {
@@ -344,17 +353,26 @@ fn eq_ignore_ascii_case(a: u8, b: u8) -> bool {
 }
 
 pub fn public_key_from_spki(spki: &[u8]) -> Result<ssh_key::PublicKey> {
-    let key_data = if let Ok(key) = ed25519_dalek::VerifyingKey::from_public_key_der(spki) {
+    let key_data = if let Ok(key) =
+        <ed25519_dalek::VerifyingKey as ed25519_dalek::pkcs8::DecodePublicKey>::from_public_key_der(
+            spki,
+        ) {
         KeyData::Ed25519(Ed25519PublicKey(key.to_bytes()))
-    } else if let Ok(key) = p256::PublicKey::from_public_key_der(spki) {
+    } else if let Ok(key) =
+        <p256::PublicKey as p256::pkcs8::DecodePublicKey>::from_public_key_der(spki)
+    {
         let key = EcdsaPublicKey::from_sec1_bytes(key.to_sec1_bytes().as_ref())
             .context("failed to convert P-256 SPKI to an SSH key")?;
         KeyData::Ecdsa(key)
-    } else if let Ok(key) = p384::PublicKey::from_public_key_der(spki) {
+    } else if let Ok(key) =
+        <p384::PublicKey as p384::pkcs8::DecodePublicKey>::from_public_key_der(spki)
+    {
         let key = EcdsaPublicKey::from_sec1_bytes(key.to_sec1_bytes().as_ref())
             .context("failed to convert P-384 SPKI to an SSH key")?;
         KeyData::Ecdsa(key)
-    } else if let Ok(key) = rsa::RsaPublicKey::from_public_key_der(spki) {
+    } else if let Ok(key) =
+        <rsa::RsaPublicKey as rsa::pkcs8::DecodePublicKey>::from_public_key_der(spki)
+    {
         let n = Mpint::from_positive_bytes(&key.n().to_bytes_be())
             .context("failed to convert RSA modulus")?;
         let e = Mpint::from_positive_bytes(&key.e().to_bytes_be())

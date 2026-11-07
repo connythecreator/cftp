@@ -5,6 +5,123 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-07
+
+### Added
+
+- `cftp get` pulls files and directory trees from a running server. Pull is
+  server-authoritative: the server resolves and validates the source path,
+  scans it, and sends a manifest before any data moves (`cftp/4`).
+- `serve` stays alive by default and accepts repeated transfers, bounded by
+  `--max-sessions`; `--one-shot` restores the previous single-session
+  behaviour. `--no-push` and `--no-pull` restrict the server's modes.
+- `cftp keygen` and `cftp pubkey` helpers, and actionable errors when no client
+  key exists.
+- `put`/`get --via-ssh [user@]host[:port]` starts a temporary one-shot server
+  on the remote host over SSH, learns its host key over the authenticated SSH
+  channel, and authorizes the local client key for that session only. No manual
+  key exchange or persistent server is needed; UDP 4433 must still be reachable
+  between the machines.
+- `serve` creates its root directory when missing and prints reachable
+  `cftp://<lan-ip>:4433/` URLs plus a copy-paste client command.
+- cftp keeps its own host key and `known_hosts` under `~/.config/cftp`, separate
+  from OpenSSH's files. A first `serve` generates an Ed25519 host key
+  automatically.
+- Adaptive congestion control (CUBIC with a BBR switch after sustained loss) and
+  `--stats` transport counters.
+- A self-contained benchmark harness (`cargo run --example bench`) and
+  `make bench-gate`, which compares cftp with scp, SFTP, HTTPS, FTP, and HTTP in
+  one Docker container over loopback and fails when cftp trails the fastest
+  security-equivalent peer (scp, SFTP, HTTPS) by more than 5 %. FTP and HTTP are
+  reported as plaintext references and do not decide the gate. CI runs the gate
+  on every push and pull request, publishes the results into `README.md` and
+  `docs/wiki/Benchmarks.md` from `main`, and a release is not published until
+  the gate passes.
+- A GitHub Pages documentation site, built with mdBook from `docs/wiki` plus the
+  README, benchmark guide, and design notes (`make book`).
+- The benchmark harness includes a `huge` dataset (1 file × 1 GiB by default,
+  64 MiB under `--quick`), configurable with `--huge-files`/`--huge-size` or
+  `CFTP_BENCH_HUGE_FILES`/`CFTP_BENCH_HUGE_SIZE`, so sustained large-file
+  throughput is measured alongside the existing datasets. The release gate
+  includes it and removes each upload once it has been measured (`--cleanup`,
+  with `--ftp-root`, `--http-put-root`, and `--https-put-root`), so the run
+  holds one generated dataset plus one copy instead of one per peer and
+  iteration.
+- Embedding conveniences in `cftp-core`: `PushOptions::new`,
+  `PullOptions::new`, `with_progress`, `with_profile`, and
+  `progress::channel`, plus a `downloader` example showing a queue with bounded
+  concurrency and cancellation. `cftp-core`'s crate docs now describe the
+  embedding model: one transfer per QUIC connection, progress events, and
+  aborting the future to cancel.
+
+### Changed
+
+- Wire protocol bumped to `cftp/4` (ALPN `cftp/4`, with `cftp/3` and `cftp/2`
+  fallback).
+- Loopback peers start at 16 KB QUIC datagrams instead of 1,200 bytes. The
+  receive-capability advertisement stays at 16 KB for every endpoint, the GSO
+  batch is capped so one `sendmsg` stays inside the kernel's 64 KiB limit, and
+  the initial congestion window scales with the MTU so a jumbo-sized Initial
+  packet can still leave. Non-loopback paths keep quinn's conservative MTU
+  discovery.
+- Compression and decompression consume their input buffer, so a chunk that is
+  sent or received raw is no longer copied a second time.
+- `known_hosts` follows OpenSSH port semantics: a bare host pattern covers port
+  22, and other ports are written as `[host]:port`. cftp's own entries are
+  always bracketed.
+- `put` rejects scp-style `host:path` destinations with a hint instead of
+  silently treating them as local paths.
+- Data payloads and control frames are bounded at 32 MiB, and received payloads
+  are allocated incrementally instead of up front.
+- `identity.key` permissions are checked on load; too-open permissions are an
+  error with the `chmod` to run.
+- The aggressive profile uses the default profile's QUIC windows, stream
+  limits, and in-flight send bounds. Allowing 256 MiB windows and 128
+  concurrent sends made the sender outrun the receiver's socket buffer on
+  loopback, and the resulting retransmissions made a 1 GiB transfer about a
+  quarter slower. Aggressive still uses larger packs, a deeper read-ahead
+  queue, five reader workers, and a larger UDP socket buffer.
+- The default profile's large-file chunk size grows from 1 MiB to 4 MiB,
+  matching aggressive; larger chunks keep the hash/compress/send workers busy
+  with fewer per-chunk round trips.
+- The large-file send path reads chunks in parallel. A pool of reader workers
+  (1 on Light, 3 on Default, 5 on Aggressive) claims chunks from a shared offset
+  cursor and fetches them with positioned reads into a bounded queue that the
+  hash/compress workers drain, so the disk keeps feeding encoders instead of
+  idling while every encoding permit is busy. Encoding concurrency is still
+  bounded by `encode_workers`. Chunks carry explicit offsets, so completion
+  order does not matter. Extra memory is bounded at the queue depth plus one
+  in-flight buffer per reader, times the chunk size per large file (about
+  52 MiB at Aggressive), and the wire format is unchanged.
+- Source layout: the transfer engine is split into `transfer/` modules by role
+  (`client`, `push`, `pull`, `server`, `receive`, `receiver`, `pull_server`,
+  `produce`, `send`, `options`),
+  the CLI into `commands/` modules, and the benchmark harness into
+  `examples/bench/` modules. This is a readability change only; public paths
+  are preserved through `transfer`'s re-exports. `docs/architecture.md` gained
+  a system map and function-level push, pull, and pipeline diagrams.
+
+### Security
+
+- Upgraded `p256`/`p384` to 0.14, removing RUSTSEC-2026-0387 (crypto-bigint
+  timing side channels).
+- `authorized_keys` entries with any option cftp cannot enforce are rejected
+  (only restriction-only flags such as `no-pty` and `restrict` are accepted).
+- The raw-public-key verifiers now refuse TLS 1.2 signatures rather than
+  verifying them against the TLS 1.3 transcript.
+- Bounded destination length, destination-by-entry memory, session slots
+  (4096), pending file descriptors, and added handshake/client-hello timeouts.
+- `--via-ssh` refuses a host key that differs from one already pinned in
+  `known_hosts`, and passes the SSH target after `--` so a hostile
+  `[USER@]HOST` cannot be interpreted as an `ssh` option.
+- Received modes have setuid, setgid, sticky, and group/other-write bits
+  stripped; temporary files are created mode 0600.
+
+### Fixed
+
+- The Arch `PKGBUILD` lists `gcc` in `makedepends`, and the package version is
+  aligned with the workspace again.
+
 ## [0.2.1] - 2026-10-22
 
 ### Fixed

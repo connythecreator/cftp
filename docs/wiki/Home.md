@@ -20,6 +20,7 @@ reference, and the source is the specification.
 | Page | What it covers |
 | --- | --- |
 | [Usage](Usage.md) | Installing, first transfer, profiles, local copies, certificate mode. |
+| [Benchmarks](Benchmarks.md) | Published results and how the release gate measures them. |
 | [Architecture](Architecture.md) | Crate boundaries, concurrency, liveness, where state lives. |
 | [Protocol](Protocol.md) | ALPN, framing, manifests, packs and chunks, compatibility rules. |
 | [Library](Library.md) | Embedding `cftp-core` as a client or server without the CLI. |
@@ -45,3 +46,9 @@ GitHub keeps a wiki in a separate repository. These pages are plain Markdown in
 starting point. Repository-relative links (`../architecture.md`,
 `../../README.md`) work in the repository; adjust them to wiki page links after
 copying.
+
+The same pages are also rendered as a site by `make book`, which stages
+`docs/wiki` plus the README, benchmark guide, and design notes into an mdBook
+and writes `book/`. `.github/workflows/docs.yml` deploys that site to GitHub
+Pages on every push to `main`; the repository's Pages setting must use
+"GitHub Actions" as its source.

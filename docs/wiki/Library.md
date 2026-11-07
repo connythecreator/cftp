@@ -20,6 +20,10 @@ Import the common types through the prelude:
 use cftp_core::prelude::*;
 ```
 
+Every transfer is one QUIC connection. `push`, `pull`, and `serve` are ordinary
+futures, so a UI can spawn them, watch progress on a channel, and cancel a
+transfer by aborting its task.
+
 ## Receiving (server half)
 
 ```rust
@@ -32,7 +36,7 @@ use cftp_core::auth::load_server_auth;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let auth = load_server_auth(
-        Path::new("/home/me/.ssh/id_ed25519"),
+        Path::new("/home/me/.config/cftp/host_key"),
         Path::new("/home/me/.ssh/authorized_keys"),
         |_| Ok(String::new()), // passphrase for encrypted host keys
     )?;
@@ -89,7 +93,7 @@ use cftp_core::trust::KnownHostsStore;
 async fn main() -> anyhow::Result<()> {
     let auth = load_client_auth(
         Path::new("/home/me/.ssh/id_ed25519"),
-        KnownHostsStore::load("/home/me/.ssh/known_hosts")?,
+        KnownHostsStore::load("/home/me/.config/cftp/known_hosts")?,
         "receiver",
         4433,
         HostKeyPolicy::Ask, // or AcceptNew / Strict
@@ -103,11 +107,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let options = PushOptions {
-        destination: "project".into(),
-        progress: Some(progress),
-        ..PushOptions::default()
-    };
+    let options = PushOptions::new("project").with_progress(progress);
     let stats = push(Path::new("./project"), "127.0.0.1:4433".parse()?, &auth, options).await?;
     println!("sent {} files, {} bytes", stats.files, stats.bytes);
     Ok(())
@@ -116,6 +116,8 @@ async fn main() -> anyhow::Result<()> {
 
 `push` scans the source itself. The destination is relative to the receiver's
 root and follows the same trailing-slash rules as the CLI.
+`PushOptions::with_profile` requests a hardware profile and applies that
+profile's default tuning in one call.
 
 ## Pulling (client half, server authoritative)
 
@@ -130,11 +132,7 @@ use cftp_core::prelude::*;
 async fn main() -> anyhow::Result<()> {
     let auth = cftp_core::auth::load_client_auth(/* as above */)?;
 
-    let options = PullOptions {
-        source: "project".into(),   // path under the server's --root
-        destination: "./downloads".into(),
-        ..PullOptions::default()
-    };
+    let options = PullOptions::new("project", "./downloads");
     let stats = pull("127.0.0.1:4433".parse()?, &auth, options).await?;
     println!("received {} files, {} bytes", stats.files, stats.bytes);
     Ok(())
@@ -149,6 +147,57 @@ async fn main() -> anyhow::Result<()> {
   server or one whose `ServePolicy` disables pull.
 - `PullStats` carries `files`, `bytes` (logical bytes written), `wire_bytes`
   (payload bytes received), and `effective_profile`.
+
+## Building a download manager
+
+`pull` is the download primitive. A download manager keeps a queue of remote
+paths and runs a bounded number of pulls at once:
+
+- Each `pull` opens its own QUIC connection. Bound concurrency to the server's
+  `max_sessions` (four by default); extra clients wait for a slot.
+- Progress arrives as `ProgressEvent::Scan`, `Receiving`, `Complete`, and
+  `Notice` values. `Receiving` carries bytes done/total, files done/total, and
+  the read/sent/recv/write counters, which is enough for a rate display.
+- Cancellation is dropping the future. Abort the task with
+  `JoinHandle::abort()`; the connection closes and no partial file is left
+  behind, because files are written to temporary files and renamed only after
+  verification.
+- Give concurrent jobs distinct destination directories so two pulls cannot
+  race on the same path.
+
+The runnable example does exactly this:
+
+```sh
+cargo run -p cftp-core --example downloader -- --dest ./downloads --jobs 4 \
+    cftp://receiver:4433/media/movie.mkv \
+    cftp://receiver:4433/attachments/42/
+```
+
+The per-job shape is small:
+
+```rust
+use cftp_core::prelude::*;
+use cftp_core::progress::channel;
+
+let (progress, mut events) = channel();
+let options = PullOptions::new("media/movie.mkv", "./downloads").with_progress(progress);
+let task = tokio::spawn(async move { pull(addr, &auth, options).await });
+
+tokio::spawn(async move {
+    while let Some(event) = events.recv().await {
+        render_ui(event);
+    }
+});
+
+// Later, from the cancel button:
+task.abort();
+```
+
+For a chat or Discord-style clone, use a stable per-attachment destination
+(`attachments/<message-id>/`) and store the returned `PullStats` with the
+message. A download-only server sets `ServePolicy::pull_only()`; an upload-only
+service uses `ServePolicy::push_only()`. Because the server is authoritative
+over pull paths, clients cannot read outside its root.
 
 ## Server policy
 
@@ -198,11 +247,13 @@ let client_auth = ClientAuth::Cert(identity);
 
 ## Examples in the repository
 
-Two runnable examples exercise the API end to end:
+Three runnable examples exercise the API end to end:
 
 ```bash
 cargo run -p cftp-core --example server -- ./incoming 127.0.0.1:4433
 cargo run -p cftp-core --example client -- ./project cftp://127.0.0.1:4433/project
+cargo run -p cftp-core --example downloader -- --dest ./downloads \
+    cftp://127.0.0.1:4433/project
 ```
 
 The client example also accepts `get`, which pulls a path from the server into a
@@ -212,17 +263,21 @@ local directory:
 cargo run -p cftp-core --example client -- get cftp://127.0.0.1:4433/project ./downloads
 ```
 
-They use `~/.ssh` for keys and reject encrypted keys, because prompting would
-add a dependency the example does not have.
+`downloader` shows a queue with bounded concurrency, per-job progress, and a
+cancel signal (`--cancel-after SECS` for a demonstration). The client and server
+examples use `~/.ssh` for keys and reject encrypted keys, because prompting
+would add a dependency the example does not have.
 
 ## Web backends and downloads
 
-A browser still cannot download files from cftp directly: browsers do not speak
-QUIC with this ALPN or postcard framing. `pull` is for another cftp peer, not
-for HTTP clients.
+A browser itself cannot download files from cftp: browsers do not speak QUIC
+with this ALPN or postcard framing. `pull` is for another cftp peer, not for
+HTTP clients.
 
-To expose cftp-transferred files to browsers, put an HTTP front end in front of
-the server's root: receive with `serve` (or `push` into a storage service), then
-let a normal HTTP file server handle `GET`, `HEAD`, and `Range` requests. The
-core library deliberately does not bundle an HTTP server, which keeps its
-dependency set small.
+There are two practical ways to expose cftp-transferred files to a browser.
+Run a native helper or extension's Rust core that uses `pull` and hands the
+finished files to the browser, or put an HTTP front end in front of the server's
+root: receive with `serve` (or `push` into a storage service), then let a normal
+HTTP file server handle `GET`, `HEAD`, and `Range` requests. The core library
+deliberately does not bundle an HTTP server, which keeps its dependency set
+small.

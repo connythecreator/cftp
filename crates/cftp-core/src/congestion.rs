@@ -33,15 +33,33 @@ const LOSS_THRESHOLD: f64 = 0.003;
 /// single burst that is not representative of the path.
 const LOSSY_WINDOWS_TO_SWITCH: u8 = 2;
 
+/// Initial congestion window in bytes, matching RFC 6928's ten packets.
+const DEFAULT_INITIAL_WINDOW: u64 = 12_000;
+
 /// Factory for [`AdaptiveController`]. Placed on every connection's transport
 /// configuration by [`crate::identity::transport_config`].
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct AdaptiveCongestionConfig;
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdaptiveCongestionConfig {
+    /// Initial congestion window. It must exceed one datagram, otherwise a
+    /// fresh connection is blocked before it can send its first packet and
+    /// never starts; connections using jumbo datagrams therefore scale it.
+    pub initial_window: u64,
+}
+
+impl Default for AdaptiveCongestionConfig {
+    fn default() -> Self {
+        Self {
+            initial_window: DEFAULT_INITIAL_WINDOW,
+        }
+    }
+}
 
 impl ControllerFactory for AdaptiveCongestionConfig {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        let mut cubic_config = CubicConfig::default();
+        cubic_config.initial_window(self.initial_window);
         Box::new(AdaptiveController {
-            cubic: Arc::new(CubicConfig::default()).build(now, current_mtu),
+            cubic: Arc::new(cubic_config).build(now, current_mtu),
             bbr: None,
             started: now,
             window_started: now,
@@ -131,10 +149,8 @@ impl AdaptiveController {
         // Seed BBR with a window close to what the path has been carrying, so
         // the switch does not stall the transfer while it re-learns. The cap
         // stops a very large CUBIC window from turning into one huge burst.
-        let seed: u64 = self
-            .cubic
-            .window()
-            .clamp(10 * u64::from(self.mtu), 256 * 1024);
+        let floor: u64 = 10 * u64::from(self.mtu);
+        let seed: u64 = self.cubic.window().clamp(floor, (256 * 1024).max(floor));
         let mut config: BbrConfig = BbrConfig::default();
         config.initial_window(seed);
         tracing::debug!(
@@ -236,7 +252,7 @@ mod tests {
     use super::*;
 
     fn controller() -> AdaptiveController {
-        let config: Arc<AdaptiveCongestionConfig> = Arc::new(AdaptiveCongestionConfig);
+        let config: Arc<AdaptiveCongestionConfig> = Arc::new(AdaptiveCongestionConfig::default());
         let built: Box<dyn Controller> = config.build(Instant::now(), 1452);
         let any: Box<dyn std::any::Any> = built.into_any();
         *any.downcast::<AdaptiveController>()

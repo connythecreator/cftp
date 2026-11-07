@@ -63,7 +63,13 @@ jobs:
       - name: Verify package contents
         run: |
           set -euo pipefail
-          pkg=$(ls packaging/arch/cftp-[0-9]*.pkg.tar.zst | head -n1)
+          shopt -s nullglob
+          pkgs=(packaging/arch/cftp-[0-9]*.pkg.tar.zst)
+          if (( ${#pkgs[@]} == 0 )); then
+            echo "no Arch package was built" >&2
+            exit 1
+          fi
+          pkg=${pkgs[0]}
           zstd -dc "$pkg" | tar -tf - > /tmp/cftp-arch-files.txt
           for path in \
             usr/bin/cftp \
@@ -87,11 +93,24 @@ jobs:
             packaging/arch/cftp.SRCINFO
           if-no-files-found: error
 
+  bench:
+    name: Benchmark gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: verify
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # A release must not regress against the security-equivalent peers. The
+      # tag's tree publishes nothing here; main-branch CI updates the README.
+      - run: CFTP_BENCH_NO_PUBLISH=1 make bench-gate
+
   release:
     name: Publish release
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [deb, arch]
+    needs: [deb, arch, bench]
     steps:
       - uses: actions/download-artifact@v8
         with:

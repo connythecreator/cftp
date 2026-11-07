@@ -23,16 +23,20 @@ RUST_LOG=cftp=debug cftp put ./src cftp://host:4433/dest
 ## Authentication failures
 
 **`the authenticity of host ... can't be established`** — the server key is not
-in `known_hosts`. Confirm the fingerprint out of band, then add it with
-`--accept-new` (or answer the prompt). A changed key for a known host is always
-rejected; remove the stale entry only after verifying the change.
+in `~/.config/cftp/known_hosts`. Confirm the fingerprint out of band, then add it
+with `--accept-new` (or answer the prompt). A changed key for a known host is
+always rejected; remove the stale entry only after verifying the change.
 
 **`client SSH key is not listed in authorized_keys`** — append the sender's
-public key to the receiver's `authorized_keys`:
+public key to the receiver's `authorized_keys` (or use `--via-ssh`, which
+authorizes the key for one session):
 
 ```bash
-cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+cftp pubkey   # on the sender; add the printed line to the receiver's authorized_keys
 ```
+
+**`private key ... is readable by other users`** — cftp refuses keys whose
+permissions grant access to group or others. Run `chmod 600` on the file.
 
 **Encrypted key / `failed to decrypt`** — the CLI prompts, but the library
 examples and many embeddings do not. Decrypt the key, use an agent-backed
@@ -42,6 +46,22 @@ unencrypted key file, or supply a passphrase callback to
 **Certificate mode** — both peers need the same `ca.pem`, and the client's
 default `--server-name` is `cftp.local`. A certificate for a different name
 needs `--server-name`.
+
+## `--via-ssh` failures
+
+- **`ssh` cannot be found** — `--via-ssh` runs the OpenSSH client. Install it,
+  or start `cftp serve` on the receiver and use a `cftp://` URL instead.
+- **`the remote cftp exited before announcing an endpoint`** — the SSH login
+  worked but `cftp` is not on the remote `PATH`. Install cftp there.
+- **`timed out waiting for ... to start cftp`** — `ssh` itself may be waiting
+  for a prompt (host-key confirmation or a passphrase). Run `ssh you@receiver`
+  once to sort that out; cftp inherits your SSH configuration.
+- **Handshake or transfer stalls after `CFTP-READY`** — SSH succeeded but UDP
+  `4433` (or the port after the host in `--via-ssh`) is not reachable between
+  the machines. SSH being open tells you nothing about QUIC.
+- **`announced a host key that differs`** — the pinned key for that host no
+  longer matches. Verify the change out of band, remove the stale
+  `~/.config/cftp/known_hosts` entry, and retry.
 
 ## The server exits or does not exit when expected
 

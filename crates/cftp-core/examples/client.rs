@@ -107,7 +107,7 @@ fn client_auth(host: &str, port: u16, accept_new: bool) -> Result<ClientAuth> {
     let ssh = SshPaths::user()?;
     let key = ssh
         .existing_client_key()
-        .with_context(|| format!("no SSH key found in {}", ssh.dir.display()))?;
+        .with_context(|| format!("no SSH key found in {}", ssh.ssh_dir.display()))?;
     let known_hosts = KnownHostsStore::load(&ssh.known_hosts)?;
     let policy = if accept_new {
         HostKeyPolicy::AcceptNew

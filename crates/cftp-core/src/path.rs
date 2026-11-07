@@ -51,6 +51,12 @@ pub fn validate_destination(path: &str) -> Result<PathBuf> {
     if path.is_empty() {
         return Ok(PathBuf::new());
     }
+    if path.len() > cftp_proto::MAX_DESTINATION_LEN {
+        bail!(
+            "destination is longer than {} bytes",
+            cftp_proto::MAX_DESTINATION_LEN
+        );
+    }
     match validate_relative(path) {
         Ok(path) => Ok(path),
         Err(_) if path == "." || path == "/" => Ok(PathBuf::new()),
@@ -195,14 +201,18 @@ pub fn create_temp_file(root: &Path, relative: &Path) -> Result<(File, PathBuf, 
 }
 
 pub fn finish_temp(
-    file: &mut File,
+    _file: &mut File,
     temp_path: &Path,
     final_path: &Path,
     mode: u32,
     mtime: i64,
 ) -> Result<()> {
-    file.sync_all()
-        .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+    // Intentionally no `fsync` here. Rename gives atomicity, which is what a
+    // completed transfer needs, while a per-file `sync_all` dominated the cost
+    // of small-file transfers on overlayfs and copy-on-write filesystems (it
+    // was one durable write per file, unlike scp or rsync). Crash durability
+    // is the filesystem's job; callers that need it can flush after the
+    // transfer.
     apply_metadata(temp_path, mode, mtime)?;
     fs::rename(temp_path, final_path).with_context(|| {
         format!(
@@ -325,7 +335,16 @@ fn create_temp(parent: &Path) -> Result<(File, PathBuf)> {
         let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let name = format!(".cftp.tmp.{}.{}", std::process::id(), id);
         let path = parent.join(name);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // In-progress data is not safe to expose before the final mode is
+            // applied in `finish_temp`.
+            options.mode(0o600);
+        }
+        match options.open(&path) {
             Ok(file) => return Ok((file, path)),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
@@ -345,12 +364,13 @@ fn apply_metadata(path: &Path, mode: u32, mtime: i64) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         // Never honour setuid/setgid/sticky bits from a remote manifest: a peer
         // must not be able to plant a setuid binary or tamper with directory
-        // ownership semantics.
-        let mode = mode & 0o777;
-        if mode != 0 {
-            fs::set_permissions(path, fs::Permissions::from_mode(mode))
-                .with_context(|| format!("failed to set mode on {}", path.display()))?;
-        }
+        // ownership semantics. Group/other write is stripped too: a remote
+        // manifest must not turn the destination tree world-writable. Mode 0 is
+        // still applied rather than skipped, because the umask default (0644)
+        // would otherwise widen it.
+        let mode = mode & 0o777 & !0o022;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .with_context(|| format!("failed to set mode on {}", path.display()))?;
     }
     let _ = mode;
     if mtime > 0 {

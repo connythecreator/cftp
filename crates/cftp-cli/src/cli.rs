@@ -21,6 +21,10 @@ pub enum Command {
         #[command(subcommand)]
         command: IdentityCommand,
     },
+    /// Generate an SSH key pair for use with cftp.
+    Keygen(KeygenArgs),
+    /// Print the public key for an SSH private key.
+    Pubkey(PubkeyArgs),
     /// Run a receiving endpoint.
     ///
     /// Stays alive and accepts further transfers unless `--one-shot` is given.
@@ -35,6 +39,23 @@ pub enum Command {
 pub enum IdentityCommand {
     /// Generate a local CA and a leaf certificate/key.
     Init(IdentityInitArgs),
+}
+
+#[derive(Args)]
+pub struct KeygenArgs {
+    /// Private key file to create [default: ~/.ssh/id_ed25519].
+    #[arg(long, short = 'f', value_hint = ValueHint::FilePath)]
+    pub output: Option<PathBuf>,
+    /// Replace an existing key file.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args)]
+pub struct PubkeyArgs {
+    /// SSH private key to read [default: the first key found in ~/.ssh].
+    #[arg(long, short = 'f', value_hint = ValueHint::FilePath)]
+    pub key: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -130,6 +151,10 @@ pub struct ServeArgs {
     /// Do not render a progress bar.
     #[arg(long)]
     pub quiet: bool,
+    /// Internal: read a client public key from stdin, announce the endpoint on
+    /// stdout, and serve exactly one transfer. Used by `put`/`get --via-ssh`.
+    #[arg(long, hide = true)]
+    pub bootstrap: bool,
 }
 
 #[derive(Args)]
@@ -168,6 +193,9 @@ pub struct PutArgs {
     #[arg(long, value_hint = ValueHint::FilePath)]
     pub key: Option<PathBuf>,
     /// CA used to verify the server certificate.
+    ///
+    /// Cert mode trusts any certificate signed by this CA, so the CA is the
+    /// identity: only accept a ca.pem from an administrator you trust.
     #[arg(long, value_hint = ValueHint::FilePath)]
     pub server_ca: Option<PathBuf>,
     /// TLS server name expected in the server certificate.
@@ -182,6 +210,14 @@ pub struct PutArgs {
     /// Hardware profile. Hotkeys can change it during the transfer.
     #[command(flatten)]
     pub hardware: HardwareArgs,
+    /// Start a temporary one-shot server on the remote host over SSH.
+    ///
+    /// Trust comes from your existing SSH access: the remote cftp host key is
+    /// learned over that channel and your client key is authorized for the
+    /// session only. UDP port 4433 (or the port after the host) must still be
+    /// reachable directly between the two machines.
+    #[arg(long, value_name = "[USER@]HOST[:PORT]", value_hint = ValueHint::Hostname)]
+    pub via_ssh: Option<String>,
     /// Size of large-file chunks in bytes.
     #[arg(long, conflicts_with = "hardware")]
     pub chunk_size: Option<usize>,
@@ -229,6 +265,9 @@ pub struct GetArgs {
     #[arg(long, value_hint = ValueHint::FilePath)]
     pub key: Option<PathBuf>,
     /// CA used to verify the server certificate.
+    ///
+    /// Cert mode trusts any certificate signed by this CA, so the CA is the
+    /// identity: only accept a ca.pem from an administrator you trust.
     #[arg(long, value_hint = ValueHint::FilePath)]
     pub server_ca: Option<PathBuf>,
     /// TLS server name expected in the server certificate.
@@ -243,4 +282,12 @@ pub struct GetArgs {
     /// Hardware profile requested for the transfer.
     #[command(flatten)]
     pub hardware: HardwareArgs,
+    /// Start a temporary one-shot server on the remote host over SSH.
+    ///
+    /// Trust comes from your existing SSH access: the remote cftp host key is
+    /// learned over that channel and your client key is authorized for the
+    /// session only. UDP port 4433 (or the port after the host) must still be
+    /// reachable directly between the two machines.
+    #[arg(long, value_name = "[USER@]HOST[:PORT]", value_hint = ValueHint::Hostname)]
+    pub via_ssh: Option<String>,
 }
