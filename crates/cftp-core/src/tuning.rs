@@ -52,6 +52,13 @@ impl Tuning {
             .unwrap_or(1);
         let (chunk_zstd_level, pack_zstd_level): (i32, i32) =
             compression_levels(profile, link_speed);
+        // Leave cores for the QUIC I/O drivers and the peer process. A 4 MiB
+        // chunk is only a few milliseconds of hashing, so a pair of workers
+        // already outruns a gigabit path; more workers on a small machine
+        // mostly contend for CPU and delay draining the UDP socket.
+        let encode_workers: usize = cores.div_ceil(2).clamp(1, 8);
+        let default_readers: usize = (cores / 2).clamp(1, 3);
+        let aggressive_readers: usize = (cores / 2).clamp(1, 5);
 
         match profile {
             HardwareProfile::Light => Self {
@@ -76,13 +83,13 @@ impl Tuning {
             },
             HardwareProfile::Default => Self {
                 profile,
-                encode_workers: cores,
+                encode_workers,
                 chunk_size: 4 * 1024 * 1024,
                 pack_target: 4 * 1024 * 1024,
                 pack_max_files: 128,
                 small_file_max: 2 * 1024 * 1024,
                 readahead_chunks: 3,
-                read_workers: 3,
+                read_workers: default_readers,
                 chunk_zstd_level,
                 pack_zstd_level,
                 max_inflight_sends: 32,
@@ -96,13 +103,13 @@ impl Tuning {
             },
             HardwareProfile::Aggressive => Self {
                 profile,
-                encode_workers: cores,
+                encode_workers,
                 chunk_size: 4 * 1024 * 1024,
                 pack_target: 16 * 1024 * 1024,
                 pack_max_files: 256,
                 small_file_max: 4 * 1024 * 1024,
                 readahead_chunks: 8,
-                read_workers: 5,
+                read_workers: aggressive_readers,
                 chunk_zstd_level,
                 pack_zstd_level,
                 max_inflight_sends: 32,
@@ -266,6 +273,9 @@ mod tests {
 
     #[test]
     fn read_pool_scales_with_profile() {
+        let cores: usize = std::thread::available_parallelism()
+            .map(|count: std::num::NonZeroUsize| -> usize { count.get() })
+            .unwrap_or(1);
         let light: Tuning = Tuning::for_profile(HardwareProfile::Light, None);
         let default_profile: Tuning = Tuning::for_profile(HardwareProfile::Default, None);
         let aggressive: Tuning = Tuning::for_profile(HardwareProfile::Aggressive, None);
@@ -273,8 +283,15 @@ mod tests {
         assert_eq!(default_profile.readahead_chunks, 3);
         assert_eq!(aggressive.readahead_chunks, 8);
         assert_eq!(light.read_workers, 1);
-        assert_eq!(default_profile.read_workers, 3);
-        assert_eq!(aggressive.read_workers, 5);
+        // Reader pools leave cores for the QUIC drivers and the peer, and are
+        // capped so a many-core host does not oversubscribe the socket.
+        assert_eq!(default_profile.read_workers, (cores / 2).clamp(1, 3));
+        assert_eq!(aggressive.read_workers, (cores / 2).clamp(1, 5));
+        assert_eq!(
+            default_profile.encode_workers,
+            cores.div_ceil(2).clamp(1, 8)
+        );
+        assert_eq!(aggressive.encode_workers, cores.div_ceil(2).clamp(1, 8));
         assert!(aggressive.readahead_chunks >= default_profile.readahead_chunks);
         assert!(default_profile.readahead_chunks >= light.readahead_chunks);
         assert!(aggressive.read_workers >= default_profile.read_workers);
@@ -302,7 +319,7 @@ mod tests {
             aggressive.stream_receive_window,
             default_profile.stream_receive_window
         );
-        assert!(aggressive.read_workers > default_profile.read_workers);
+        assert!(aggressive.read_workers >= default_profile.read_workers);
         assert!(aggressive.socket_buffer > default_profile.socket_buffer);
     }
 
@@ -321,7 +338,11 @@ mod tests {
             TuningController::new(Tuning::for_profile(HardwareProfile::Light, None));
         assert_eq!(controller.permits().available_permits(), 1);
         controller.set_profile(HardwareProfile::Aggressive, None);
-        assert!(controller.permits().available_permits() > 1);
+        let aggressive: Tuning = Tuning::for_profile(HardwareProfile::Aggressive, None);
+        assert_eq!(
+            controller.permits().available_permits(),
+            aggressive.encode_workers
+        );
         controller.set_profile(HardwareProfile::Light, None);
         assert_eq!(controller.permits().available_permits(), 1);
     }

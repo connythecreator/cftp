@@ -368,6 +368,19 @@ pub(super) fn join_reader(reader: JoinHandle<String>) -> String {
     reader.join().unwrap_or_default()
 }
 
+/// Flushes dirty pages before a dataset is measured.
+///
+/// Dataset generation leaves more than a gigabyte queued in the page cache on
+/// the huge run. The first tool measured afterwards absorbs the resulting
+/// writeback, while later peers start from a clean cache. Flushing before the
+/// first measurement gives every peer the same starting state.
+pub(super) fn flush_writes() {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("sync").status();
+    }
+}
+
 pub(super) fn brief(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.is_empty() {

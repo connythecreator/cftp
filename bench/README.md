@@ -280,6 +280,10 @@ slower than the fastest of them on any dataset.
 - **Single-run noise**: filesystem cache state, CPU frequency scaling, and
   background load can dominate a single run. Use `--iterations 3` or more and
   compare the median.
+- **Page cache**: generating a dataset leaves dirty pages queued for writeback,
+  and the first peer measured would otherwise absorb that cost while later
+  peers start clean. The harness runs `sync` before measuring each dataset so
+  every peer begins from the same page-cache state.
 
 ## Flags and environment
 

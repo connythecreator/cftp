@@ -80,16 +80,24 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   concurrent sends made the sender outrun the receiver's socket buffer on
   loopback, and the resulting retransmissions made a 1 GiB transfer about a
   quarter slower. Aggressive still uses larger packs, a deeper read-ahead
-  queue, five reader workers, and a larger UDP socket buffer.
+  queue, more reader workers, and a larger UDP socket buffer.
 - The default profile's large-file chunk size grows from 1 MiB to 4 MiB,
   matching aggressive; larger chunks keep the hash/compress/send workers busy
   with fewer per-chunk round trips.
+- Encode and reader worker counts adapt to the machine instead of assuming a
+  large host: `encode_workers` is half the available cores (capped at 8), and
+  the reader pools top out at 3 (Default) and 5 (Aggressive). Oversubscribing a
+  four-core CI runner left no CPU for the QUIC drivers to drain the UDP socket,
+  which showed up as retransmissions and a slower 1 GiB transfer; the same
+  change leaves a many-core host unaffected because encoding is not the
+  bottleneck once a few workers can keep up with the sender.
 - The large-file send path reads chunks in parallel. A pool of reader workers
-  (1 on Light, 3 on Default, 5 on Aggressive) claims chunks from a shared offset
-  cursor and fetches them with positioned reads into a bounded queue that the
-  hash/compress workers drain, so the disk keeps feeding encoders instead of
-  idling while every encoding permit is busy. Encoding concurrency is still
-  bounded by `encode_workers`. Chunks carry explicit offsets, so completion
+  (1 on Light, up to 3 on Default, up to 5 on Aggressive) claims chunks from a
+  shared offset cursor and fetches them with positioned reads into a bounded
+  queue that the hash/compress workers drain, so the disk keeps feeding
+  encoders instead of idling while every encoding permit is busy. Encoding
+  concurrency is still bounded by `encode_workers`. Chunks carry explicit
+  offsets, so completion
   order does not matter. Extra memory is bounded at the queue depth plus one
   in-flight buffer per reader, times the chunk size per large file (about
   52 MiB at Aggressive), and the wire format is unchanged.

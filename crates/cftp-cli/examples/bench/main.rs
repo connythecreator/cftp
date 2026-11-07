@@ -172,6 +172,7 @@ fn run() -> Result<(), String> {
     let mut rows = Vec::new();
     for dataset in &datasets {
         eprintln!("measuring {}...", dataset.name);
+        flush_writes();
         match bench_dataset(&ctx, dataset, &tools, &mut notes) {
             Ok(mut measured) => rows.append(&mut measured),
             Err(err) => {
