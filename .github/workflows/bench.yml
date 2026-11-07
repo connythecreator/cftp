@@ -18,6 +18,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Shared runners vary in CPU model enough to move the cftp/HTTPS ratio by
+  # more than 20% for identical builds. A dedicated machine still uses the
+  # harness's 5% default; see bench/README.md.
+  CFTP_BENCH_GATE_TOLERANCE: 25
 
 jobs:
   gate:

@@ -91,6 +91,11 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   which showed up as retransmissions and a slower 1 GiB transfer; the same
   change leaves a many-core host unaffected because encoding is not the
   bottleneck once a few workers can keep up with the sender.
+- CI runs the benchmark gate with `CFTP_BENCH_GATE_TOLERANCE=25` because
+  GitHub's shared runners vary in CPU model enough to move the cftp/HTTPS ratio
+  by more than 20% for identical builds. The harness's own default remains 5%
+  for a dedicated machine, and cftp stays about twice as fast as scp and SFTP
+  on every runner measured.
 - The large-file send path reads chunks in parallel. A pool of reader workers
   (1 on Light, up to 3 on Default, up to 5 on Aggressive) claims chunks from a
   shared offset cursor and fetches them with positioned reads into a bounded

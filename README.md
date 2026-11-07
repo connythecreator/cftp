@@ -379,8 +379,11 @@ Results come from `make bench-gate`: cftp, scp, SFTP, HTTPS, FTP, and HTTP in on
 Docker container over loopback, medians of repeated runs (`BENCH_ITERATIONS`,
 default 3), with byte-for-byte verification after the timer stops. The release
 gate fails when cftp is more than 5% slower than the fastest
-security-equivalent peer (scp, SFTP, HTTPS) on any dataset. FTP and HTTP are plaintext and are published as reference rows
-only. The gate also runs a 1 GiB `huge` dataset with the aggressive profile, and
+security-equivalent peer (scp, SFTP, HTTPS) on any dataset. CI runs it with
+`CFTP_BENCH_GATE_TOLERANCE=25` because GitHub's shared runners vary in CPU
+model enough to move that ratio by more than 20% for identical builds; a
+dedicated machine keeps the 5% bar. FTP and HTTP are plaintext and are
+published as reference rows only. The gate also runs a 1 GiB `huge` dataset with the aggressive profile, and
 removes each upload once it has been measured, so the run holds one generated
 dataset plus one copy instead of one copy per peer. See
 [the benchmark page](docs/wiki/Benchmarks.md) for

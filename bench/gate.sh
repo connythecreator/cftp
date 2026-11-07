@@ -10,6 +10,8 @@
 #   BENCH_SMALL_SIZE, BENCH_LARGE_SIZE, BENCH_HUGE_FILES, BENCH_HUGE_SIZE,
 #   BENCH_MIXED_DIRS, BENCH_MIXED_PER_DIR,
 #   BENCH_MIXED_SMALL_SIZE, BENCH_MIXED_LARGE_SIZE  forwarded to the container.
+#   CFTP_BENCH_GATE_TOLERANCE overrides the harness's 5% default; CI sets it
+#   to 25 because shared runners vary in CPU model.
 #   CFTP_BENCH_IMAGE        image tag (default cftp-bench-gate)
 #   CFTP_BENCH_NO_PUBLISH   set to 1 to leave README/docs untouched
 set -euo pipefail
@@ -38,7 +40,8 @@ docker_args=(
 for name in BENCH_ITERATIONS BENCH_DATASETS BENCH_LABEL BENCH_SMALL_COUNT \
     BENCH_SMALL_SIZE BENCH_LARGE_SIZE BENCH_HUGE_FILES BENCH_HUGE_SIZE \
     BENCH_MIXED_DIRS BENCH_MIXED_PER_DIR \
-    BENCH_MIXED_SMALL_SIZE BENCH_MIXED_LARGE_SIZE; do
+    BENCH_MIXED_SMALL_SIZE BENCH_MIXED_LARGE_SIZE \
+    CFTP_BENCH_GATE_TOLERANCE; do
     if [[ -n "${!name:-}" ]]; then
         docker_args+=(--env "$name")
     fi

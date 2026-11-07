@@ -98,6 +98,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     needs: verify
+    env:
+      # Match bench.yml: shared runners vary in CPU model enough to move the
+      # cftp/HTTPS ratio by more than 20% for identical builds.
+      CFTP_BENCH_GATE_TOLERANCE: 25
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
