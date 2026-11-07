@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use rsa::traits::PublicKeyParts;
 use sha1::Sha1;
 use ssh_key::known_hosts::{HostPatterns, KnownHosts, Marker};
