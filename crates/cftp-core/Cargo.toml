@@ -19,12 +19,14 @@ netdev.workspace = true
 p256.workspace = true
 p384.workspace = true
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+quinn-proto = { version = "0.11", default-features = false }
 rcgen.workspace = true
 rsa.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 sha1.workspace = true
 sha2.workspace = true
+socket2.workspace = true
 ssh-key.workspace = true
 tokio.workspace = true
 tracing.workspace = true

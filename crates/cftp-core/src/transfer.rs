@@ -23,6 +23,7 @@ use crate::link::{NetworkOptimizer, NetworkSample, compression_levels, detect_li
 use crate::path;
 use crate::progress::{ProgressEvent, ProgressSender, TransferProgress};
 use crate::scan;
+use crate::socket::bind_endpoint;
 use crate::tuning::{MAX_INFLIGHT_SENDS, Tuning, TuningController, apply_connection_tuning};
 
 /// How long to wait for the QUIC handshake and the control stream to appear.
@@ -104,6 +105,51 @@ impl Default for PushOptions {
     }
 }
 
+/// Transport-level counters sampled when a transfer finishes.
+///
+/// These describe the QUIC path, not the files: they are what `--stats` prints
+/// and what an adaptive optimisation needs in order to tell a slow link from a
+/// self-inflicted bottleneck.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransportStats {
+    /// Smoothed round-trip time.
+    pub rtt_micros: u64,
+    /// Lowest round-trip time observed on this path.
+    pub min_rtt_micros: u64,
+    /// Congestion window in bytes.
+    pub cwnd: u64,
+    /// Path MTU in bytes.
+    pub mtu: u16,
+    pub sent_packets: u64,
+    pub lost_packets: u64,
+    pub congestion_events: u64,
+    pub udp_tx_datagrams: u64,
+    pub udp_rx_datagrams: u64,
+    pub udp_tx_bytes: u64,
+    pub udp_rx_bytes: u64,
+}
+
+impl TransportStats {
+    /// Samples the connection before it is closed.
+    fn sample(connection: &Connection) -> Self {
+        let stats = connection.stats();
+        let path = stats.path;
+        Self {
+            rtt_micros: u64::try_from(path.rtt.as_micros()).unwrap_or(u64::MAX),
+            min_rtt_micros: u64::try_from(path.min_rtt.as_micros()).unwrap_or(u64::MAX),
+            cwnd: path.cwnd,
+            mtu: path.current_mtu,
+            sent_packets: path.sent_packets,
+            lost_packets: path.lost_packets,
+            congestion_events: path.congestion_events,
+            udp_tx_datagrams: stats.udp_tx.datagrams,
+            udp_rx_datagrams: stats.udp_rx.datagrams,
+            udp_tx_bytes: stats.udp_tx.bytes,
+            udp_rx_bytes: stats.udp_rx.bytes,
+        }
+    }
+}
+
 /// Counters from one completed client-side transfer.
 #[derive(Debug, Clone, Default)]
 pub struct PushStats {
@@ -112,6 +158,8 @@ pub struct PushStats {
     pub packs: u64,
     pub chunks: u64,
     pub effective_profile: HardwareProfile,
+    /// Transport counters sampled when the transfer finished.
+    pub transport: TransportStats,
 }
 
 /// Scans `src` and pushes it to `addr` over QUIC.
@@ -177,7 +225,7 @@ pub async fn push(
     } else {
         "0.0.0.0:0".parse().expect("valid ipv4 bind address")
     };
-    let mut endpoint: Endpoint = Endpoint::client(bind)?;
+    let mut endpoint: Endpoint = bind_endpoint(bind, None, &opts.tuning)?;
     endpoint.set_default_client_config(auth.client_config(&opts.tuning, opts.force_v2)?);
     let connecting = endpoint
         .connect(addr, &opts.server_name)
@@ -629,6 +677,7 @@ pub async fn push(
     stats.files = done.files;
     stats.bytes = done.bytes;
     stats.effective_profile = effective_profile;
+    stats.transport = TransportStats::sample(&connection);
 
     if let Some(progress) = &opts.progress {
         let _ = progress.send(ProgressEvent::Complete {
@@ -678,6 +727,8 @@ pub struct PullStats {
     /// Payload bytes received over the wire, before decompression.
     pub wire_bytes: u64,
     pub effective_profile: HardwareProfile,
+    /// Transport counters sampled when the transfer finished.
+    pub transport: TransportStats,
 }
 
 fn notify(progress: &Option<ProgressSender>, message: impl Into<String>) {
@@ -701,7 +752,7 @@ async fn connect_client(
     } else {
         "0.0.0.0:0".parse().expect("valid ipv4 bind address")
     };
-    let mut endpoint: Endpoint = Endpoint::client(bind)?;
+    let mut endpoint: Endpoint = bind_endpoint(bind, None, tuning)?;
     endpoint.set_default_client_config(auth.client_config(tuning, force_v2)?);
     let connecting = endpoint
         .connect(addr, server_name)
@@ -1121,6 +1172,7 @@ pub async fn pull(addr: SocketAddr, auth: &ClientAuth, opts: PullOptions) -> Res
         bytes: bytes_done,
         wire_bytes,
         effective_profile,
+        transport: TransportStats::sample(&connection),
     })
 }
 
@@ -1746,9 +1798,10 @@ pub async fn serve(auth: &ServerAuth, mut opts: ServeOptions) -> Result<ServeSta
 
     let current_profile: HardwareProfile = opts.max_profile.min(HardwareProfile::Default);
     let initial_tuning: Tuning = Tuning::for_profile(current_profile, None);
-    let endpoint: Endpoint = Endpoint::server(
-        auth.server_config(&initial_tuning, opts.force_v2)?,
+    let endpoint: Endpoint = bind_endpoint(
         opts.listen,
+        Some(auth.server_config(&initial_tuning, opts.force_v2)?),
+        &initial_tuning,
     )?;
     let local_addr: SocketAddr = endpoint.local_addr()?;
     if let Some(on_ready) = opts.on_ready.take() {

@@ -24,12 +24,14 @@
 
 pub mod auth;
 pub mod codec;
+mod congestion;
 pub mod identity;
 pub mod link;
 pub mod local;
 pub mod path;
 pub mod progress;
 pub mod scan;
+mod socket;
 pub mod ssh;
 pub mod transfer;
 pub mod trust;
@@ -42,7 +44,7 @@ pub mod prelude {
     pub use crate::progress::{ProgressEvent, ProgressSender, TransferProgress};
     pub use crate::transfer::{
         PullOptions, PullStats, PushOptions, PushStats, ServeOptions, ServePolicy, ServeStats,
-        pull, push, serve, serve_once,
+        TransportStats, pull, push, serve, serve_once,
     };
     pub use crate::tuning::{HardwareProfile, Tuning};
 }

@@ -93,6 +93,28 @@ rejected before any scan, path resolution, or file creation.
 - On `cftp/2`, profile flags and hotkeys are ignored.
 - Quinn supports changing send/receive windows and stream limits after the
   handshake. `stream_receive_window` is fixed at connection setup.
+- Each endpoint's UDP socket is bound with `SO_RCVBUF`/`SO_SNDBUF` sized from the
+  profile (1 MiB light, 4 MiB default, 8 MiB aggressive), clamped by the kernel's
+  `rmem_max`/`wmem_max`. The kernel default is a few hundred KiB; on a jittery
+  or high-RTT path that overflows during a burst, and QUIC reads the drops as
+  congestion loss. The receiver's buffer matters most, so `serve` sizes it from
+  the profile it starts with; `socket_buffer` in `Tuning` cannot be changed
+  after the endpoint is bound.
+
+## Congestion control
+
+- Every connection starts on QUIC's CUBIC controller with the profile's
+  windows. `congestion.rs` measures delivered and lost bytes over 250 ms
+  windows; after two consecutive windows above 0.3% loss it replaces the
+  controller with BBR, seeded from the current window, and forwards every
+  later signal to it.
+- Clean paths (loopback, wired LAN) measure no loss and stay on CUBIC, which
+  is faster there. The switch is one-way for the life of a connection: a path
+  that drops packets does not become clean during the same transfer, and
+  re-seeding CUBIC from BBR's larger window is not safe.
+- This runs on both peers and is independent of the hardware profile. It
+  changes only the QUIC congestion controller; zstd and the wire format are
+  untouched.
 
 ## Packing and chunking
 

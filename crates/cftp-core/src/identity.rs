@@ -14,6 +14,7 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
 
+use crate::congestion::AdaptiveCongestionConfig;
 use crate::tuning::Tuning;
 
 pub const DEFAULT_SERVER_NAME: &str = "cftp.local";
@@ -128,6 +129,9 @@ pub(crate) fn transport_config(tuning: &Tuning) -> quinn::TransportConfig {
         quinn::VarInt::from_u64(tuning.stream_receive_window).expect("valid stream receive window"),
     );
     transport.send_window(tuning.send_window);
+    // Every path starts on CUBIC; the controller switches itself to BBR only
+    // after measuring sustained loss (see `congestion.rs`).
+    transport.congestion_controller_factory(Arc::new(AdaptiveCongestionConfig));
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
     transport.max_idle_timeout(Some(
         Duration::from_secs(60)

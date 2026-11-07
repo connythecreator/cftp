@@ -28,6 +28,8 @@ accepts and which paths clients may read or write.
 - Light, default, and aggressive hardware profiles.
 - Live profile hotkeys during `put`, with server-side caps.
 - zstd compression, skipping known incompressible file extensions.
+- Adaptive congestion control: CUBIC on clean paths, switching to BBR when
+  the path shows sustained packet loss.
 - Small-file packs and offset-based chunks for large files.
 - BLAKE3 integrity checks for every pack entry and chunk.
 - Atomic writes, preserved mtimes, and preserved modes on Unix.
@@ -142,7 +144,9 @@ profile.
 `serve` defaults to a `default` cap. Run `serve --aggressive` to allow clients
 to request aggressive mode; `serve --light` caps all clients at light.
 `--aggressive` uses the detected link speed and observed transfer throughput
-to choose zstd levels while the transfer runs.
+to choose zstd levels while the transfer runs. Independently of the profile,
+every connection starts on CUBIC and switches to BBR if its path shows
+sustained packet loss; clean paths keep CUBIC.
 
 Profiles are mutually exclusive with `--chunk-size`, `--pack-target`,
 `--pack-max-files`, and `--small-file-max`.
@@ -240,6 +244,7 @@ On Linux the default directory is `~/.config/cftp`.
 | `--server-ca <FILE>` | CA used to verify the server certificate (cert mode). |
 | `--server-name <NAME>` | Expected server name. Defaults to `cftp.local`. |
 | `--quiet` | Disable the progress bar. |
+| `--stats` | Print QUIC transport counters (RTT, congestion window, loss) after the transfer. |
 | `--chunk-size <BYTES>` | Large-file chunk size. Defaults to 1 MiB. |
 | `--pack-target <BYTES>` | Target size of a small-file pack. Defaults to 4 MiB. |
 | `--pack-max-files <N>` | Maximum files per pack. Defaults to 128. |
@@ -264,6 +269,7 @@ is accepted; any other `://` destination is rejected.
 | `--server-ca <FILE>` | CA used to verify the server certificate (cert mode). |
 | `--server-name <NAME>` | Expected server name. Defaults to `cftp.local`. |
 | `--quiet` | Disable the progress bar. |
+| `--stats` | Print QUIC transport counters (RTT, congestion window, loss) after the transfer. |
 
 A remote `get` requires `cftp/4`. The server resolves the requested path under
 its root, refusing traversal and symlink escapes, and streams the tree using the

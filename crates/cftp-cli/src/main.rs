@@ -17,8 +17,8 @@ use cftp_core::local::{LocalCopyStats, copy_local};
 use cftp_core::progress::{ProgressEvent, ProgressSender, TransferProgress};
 use cftp_core::ssh::{SshPaths, load_private_key};
 use cftp_core::transfer::{
-    PullOptions, PullStats, PushOptions, PushStats, ServeOptions, ServePolicy, ServeStats, pull,
-    push, serve,
+    PullOptions, PullStats, PushOptions, PushStats, ServeOptions, ServePolicy, ServeStats,
+    TransportStats, pull, push, serve,
 };
 use cftp_core::trust::{AuthorizedKeys, KnownHostsStore};
 use cftp_core::tuning::{HardwareProfile, Tuning};
@@ -324,6 +324,9 @@ async fn put(args: PutArgs) -> Result<()> {
                 "sent {} files, {} bytes ({} packs, {} chunks, profile {})",
                 stats.files, stats.bytes, stats.packs, stats.chunks, stats.effective_profile
             );
+            if args.stats {
+                print_transport(&stats.transport);
+            }
             Ok(())
         }
     }
@@ -459,9 +462,32 @@ async fn get(args: GetArgs) -> Result<()> {
                 "received {} files, {} bytes (profile {})",
                 stats.files, stats.bytes, stats.effective_profile
             );
+            if args.stats {
+                print_transport(&stats.transport);
+            }
             Ok(())
         }
     }
+}
+
+/// Prints one stable, greppable line of transport counters.
+fn print_transport(stats: &TransportStats) {
+    println!(
+        "stats: rtt_ms={:.2} min_rtt_ms={:.2} cwnd={} mtu={} sent_packets={} lost_packets={} \
+         congestion_events={} udp_tx_datagrams={} udp_rx_datagrams={} udp_tx_bytes={} \
+         udp_rx_bytes={}",
+        stats.rtt_micros as f64 / 1000.0,
+        stats.min_rtt_micros as f64 / 1000.0,
+        stats.cwnd,
+        stats.mtu,
+        stats.sent_packets,
+        stats.lost_packets,
+        stats.congestion_events,
+        stats.udp_tx_datagrams,
+        stats.udp_rx_datagrams,
+        stats.udp_tx_bytes,
+        stats.udp_rx_bytes,
+    );
 }
 
 enum Destination {

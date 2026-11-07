@@ -25,6 +25,10 @@ pub struct Tuning {
     pub receive_window: u64,
     pub stream_receive_window: u64,
     pub send_window: u64,
+    /// Best-effort `SO_RCVBUF`/`SO_SNDBUF` for the UDP socket. The kernel
+    /// clamps this to its `rmem_max`/`wmem_max`, so a value above the system
+    /// limit is harmless.
+    pub socket_buffer: usize,
 }
 
 impl Default for Tuning {
@@ -58,6 +62,7 @@ impl Tuning {
                 receive_window: 8 * 1024 * 1024,
                 stream_receive_window: 2 * 1024 * 1024,
                 send_window: 8 * 1024 * 1024,
+                socket_buffer: 1024 * 1024,
             },
             HardwareProfile::Default => Self {
                 profile,
@@ -75,6 +80,7 @@ impl Tuning {
                 receive_window: 64 * 1024 * 1024,
                 stream_receive_window: 16 * 1024 * 1024,
                 send_window: 64 * 1024 * 1024,
+                socket_buffer: 4 * 1024 * 1024,
             },
             HardwareProfile::Aggressive => Self {
                 profile,
@@ -92,6 +98,7 @@ impl Tuning {
                 receive_window: 256 * 1024 * 1024,
                 stream_receive_window: 64 * 1024 * 1024,
                 send_window: 256 * 1024 * 1024,
+                socket_buffer: 8 * 1024 * 1024,
             },
         }
     }
@@ -229,6 +236,7 @@ mod tests {
         assert_eq!(tuning.pack_zstd_level, 3);
         assert_eq!(tuning.max_inflight_sends, 32);
         assert_eq!(tuning.max_inflight_streams, 32);
+        assert_eq!(tuning.socket_buffer, 4 * 1024 * 1024);
     }
 
     #[test]
@@ -239,6 +247,7 @@ mod tests {
         assert!(light.chunk_size < aggressive.chunk_size);
         assert!(light.max_inflight_sends < aggressive.max_inflight_sends);
         assert!(light.receive_window < aggressive.receive_window);
+        assert!(light.socket_buffer < aggressive.socket_buffer);
     }
 
     #[test]

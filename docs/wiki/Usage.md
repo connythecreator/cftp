@@ -109,6 +109,13 @@ request a profile change without restarting.
 Profiles are mutually exclusive with `--chunk-size`, `--pack-target`,
 `--pack-max-files`, and `--small-file-max`.
 
+Separately from the profile, cftp watches each connection for packet loss. A
+clean path (loopback or wired LAN) stays on CUBIC. After two consecutive
+measurement windows above 0.3% loss it switches that connection to BBR, which
+handles random loss far better on Wi-Fi and other wireless links. The switch
+affects the QUIC congestion controller only; zstd compression and integrity
+checking are unchanged.
+
 Older `cftp/2` and `cftp/3` peers work for pushes, but ignore profiles and
 hotkeys on `cftp/2`; pull is refused unless both peers speak `cftp/4`.
 
@@ -119,6 +126,11 @@ payload bytes received by the receiver, and logical bytes written to disk.
 During a pull the roles reverse, so `recv` and `write` describe the local
 client. Compression means read/write can differ substantially from
 sent/received. Use `--quiet` in scripts.
+
+Pass `--stats` to `put` or `get` to print one line of QUIC transport counters
+after the transfer: smoothed and minimum RTT, congestion window, path MTU,
+packets sent and lost, congestion events, and UDP datagram and byte counts. The
+line starts with `stats:` so it is easy to grep in a benchmark log.
 
 ## Certificate mode
 

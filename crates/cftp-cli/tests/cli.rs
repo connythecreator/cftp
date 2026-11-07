@@ -185,7 +185,7 @@ fn loopback_serve_and_put() {
 
     let url = format!("cftp://127.0.0.1:{port}/incoming");
     let mut last_failure = None;
-    let mut sent = false;
+    let mut sent_output = None;
     let deadline = Instant::now() + PUT_DEADLINE;
     for _ in 0..50 {
         if Instant::now() > deadline {
@@ -206,23 +206,32 @@ fn loopback_serve_and_put() {
             .arg("--server-ca")
             .arg(identity_dir.join("ca.pem"))
             .arg("--quiet")
+            .arg("--stats")
             .output()
             .unwrap();
 
         if output.status.success() {
-            sent = true;
+            sent_output = Some(output);
             break;
         }
         last_failure = Some(output);
         thread::sleep(Duration::from_millis(100));
     }
 
+    let Some(output) = sent_output else {
+        panic!(
+            "put never succeeded within {PUT_DEADLINE:?}: {}",
+            last_failure
+                .map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
+                .unwrap_or_default()
+        );
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        sent,
-        "put never succeeded within {PUT_DEADLINE:?}: {}",
-        last_failure
-            .map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
-            .unwrap_or_default()
+        stdout
+            .lines()
+            .any(|line| line.starts_with("stats: rtt_ms=")),
+        "expected a transport stats line, got: {stdout}"
     );
 
     let deadline = Instant::now() + Duration::from_secs(5);

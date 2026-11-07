@@ -176,6 +176,9 @@ pub struct PutArgs {
     /// Do not render a progress bar.
     #[arg(long)]
     pub quiet: bool,
+    /// Print transport statistics after the transfer.
+    #[arg(long)]
+    pub stats: bool,
     /// Hardware profile. Hotkeys can change it during the transfer.
     #[command(flatten)]
     pub hardware: HardwareArgs,
@@ -234,6 +237,9 @@ pub struct GetArgs {
     /// Do not render a progress bar.
     #[arg(long)]
     pub quiet: bool,
+    /// Print transport statistics after the transfer.
+    #[arg(long)]
+    pub stats: bool,
     /// Hardware profile requested for the transfer.
     #[command(flatten)]
     pub hardware: HardwareArgs,
