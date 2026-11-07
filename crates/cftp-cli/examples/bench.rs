@@ -113,6 +113,10 @@ struct Config {
     ftp_url: Option<String>,
     http_url: Option<String>,
     timeout_secs: u64,
+    /// Run cftp against an already-running server instead of spawning one.
+    endpoint: Option<String>,
+    /// Certificate directory used with `endpoint`.
+    cert_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -145,6 +149,8 @@ struct RawArgs {
     ftp_url: Option<String>,
     http_url: Option<String>,
     timeout_secs: Option<u64>,
+    endpoint: Option<String>,
+    cert_dir: Option<String>,
 }
 
 fn parse_config() -> Result<Config, String> {
@@ -246,6 +252,19 @@ fn parse_config() -> Result<Config, String> {
         .unwrap_or_else(|| "/tmp".to_string());
     let ftp_url = raw.ftp_url.or_else(|| env_nonempty("CFTP_BENCH_FTP_URL"));
     let http_url = raw.http_url.or_else(|| env_nonempty("CFTP_BENCH_HTTP_URL"));
+    let endpoint = raw.endpoint.or_else(|| env_nonempty("CFTP_BENCH_ENDPOINT"));
+    if let Some(endpoint) = &endpoint
+        && (endpoint.contains("://") || !endpoint.contains(':'))
+    {
+        return Err(format!(
+            "--endpoint must be HOST:PORT without a scheme, got {endpoint:?}"
+        ));
+    }
+    let cert_dir = raw
+        .cert_dir
+        .or_else(|| env_nonempty("CFTP_BENCH_CERT_DIR"))
+        .map(PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty());
 
     Ok(Config {
         quick,
@@ -264,6 +283,8 @@ fn parse_config() -> Result<Config, String> {
         ftp_url,
         http_url,
         timeout_secs: raw.timeout_secs.unwrap_or(0),
+        endpoint,
+        cert_dir,
     })
 }
 
@@ -335,6 +356,8 @@ fn parse_raw() -> Result<RawArgs, String> {
             "--ssh-dest" => raw.ssh_dest = Some(value_for(flag, inline, &args, &mut index)?),
             "--ftp-url" => raw.ftp_url = Some(value_for(flag, inline, &args, &mut index)?),
             "--http-url" => raw.http_url = Some(value_for(flag, inline, &args, &mut index)?),
+            "--endpoint" => raw.endpoint = Some(value_for(flag, inline, &args, &mut index)?),
+            "--cert-dir" => raw.cert_dir = Some(value_for(flag, inline, &args, &mut index)?),
             "--timeout" => {
                 raw.timeout_secs = Some(parse_u64(
                     flag,
@@ -503,12 +526,19 @@ Options:
   --http-url <URL>            Download large.bin from this base URL (or
                               CFTP_BENCH_HTTP_URL); otherwise a local python3
                               http.server baseline is used when available
+  --endpoint <HOST:PORT>      Benchmark cftp against this already-running
+                              server instead of spawning one (or
+                              CFTP_BENCH_ENDPOINT). Received bytes are not
+                              verified in this mode.
+  --cert-dir <DIR>            Certificate directory for --endpoint (or
+                              CFTP_BENCH_CERT_DIR; default: ~/.config/cftp)
   --timeout <SECS>            Per-command timeout (default: automatic)
   --keep                      Keep the temporary workspace
   -h, --help                  Print this help
 
 Environment:
   CFTP_BENCH_SSH, CFTP_BENCH_SSH_DEST, CFTP_BENCH_FTP_URL, CFTP_BENCH_HTTP_URL,
+  CFTP_BENCH_ENDPOINT, CFTP_BENCH_CERT_DIR,
   CFTP_BENCH_ITERATIONS, CFTP_BENCH_SMALL_COUNT, CFTP_BENCH_SMALL_SIZE,
   CFTP_BENCH_LARGE_SIZE, CFTP_BENCH_MIXED_DIRS, CFTP_BENCH_MIXED_PER_DIR,
   CFTP_BENCH_MIXED_SMALL_SIZE, CFTP_BENCH_MIXED_LARGE_SIZE
@@ -1011,6 +1041,7 @@ fn lock_snapshot(buffer: &Arc<Mutex<String>>) -> String {
 struct RunResult {
     status: ExitStatus,
     elapsed: Duration,
+    stdout: String,
     stderr: String,
 }
 
@@ -1050,11 +1081,12 @@ fn run_timed(label: &str, mut command: Command, timeout: Duration) -> Result<Run
     };
 
     let elapsed = start.elapsed();
-    let _stdout = stdout.map(join_reader).unwrap_or_default();
+    let stdout = stdout.map(join_reader).unwrap_or_default();
     let stderr = stderr.map(join_reader).unwrap_or_default();
     Ok(RunResult {
         status,
         elapsed,
+        stdout,
         stderr,
     })
 }
@@ -1282,6 +1314,9 @@ fn measure_cftp(ctx: &Ctx<'_>, dataset: &Dataset) -> Result<Vec<Duration>, Strin
 }
 
 fn cftp_once(ctx: &Ctx<'_>, dataset: &Dataset, destination: &Path) -> Result<Duration, String> {
+    if let Some(endpoint) = &ctx.cfg.endpoint {
+        return cftp_once_remote(ctx, dataset, destination, endpoint);
+    }
     let port = free_udp_port()?;
     let listen = format!("127.0.0.1:{port}");
 
@@ -1316,7 +1351,8 @@ fn cftp_once(ctx: &Ctx<'_>, dataset: &Dataset, destination: &Path) -> Result<Dur
         .arg(ctx.identity.join("identity.key"))
         .arg("--server-ca")
         .arg(ctx.identity.join("ca.pem"))
-        .arg("--quiet");
+        .arg("--quiet")
+        .arg("--stats");
 
     let timeout = ctx.cfg.command_timeout(dataset.bytes);
     let put_result = run_timed("cftp put", put, timeout);
@@ -1355,7 +1391,63 @@ fn cftp_once(ctx: &Ctx<'_>, dataset: &Dataset, destination: &Path) -> Result<Dur
         })?;
     let landed = destination.join("incoming").join(source_name);
     verify_tree(&dataset.root, &landed)?;
+    report_transport(&dataset.name, &run.stdout);
     Ok(run.elapsed)
+}
+
+/// Pushes one dataset to an already-running server named by `--endpoint`.
+///
+/// The peer cannot be inspected from here, so there is no tree verification and
+/// no cleanup of the remote copy.
+fn cftp_once_remote(
+    ctx: &Ctx<'_>,
+    dataset: &Dataset,
+    destination: &Path,
+    endpoint: &str,
+) -> Result<Duration, String> {
+    let run_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("run path {} has no usable name", destination.display()))?;
+    let url = format!(
+        "cftp://{endpoint}/cftp-bench-{}-{}-{run_name}",
+        std::process::id(),
+        dataset.name
+    );
+
+    let mut put = Command::new(ctx.cftp);
+    put.arg("put")
+        .arg(&dataset.root)
+        .arg(&url)
+        .arg("--auth")
+        .arg("cert")
+        .arg("--identity")
+        .arg(ctx.identity.join("identity.pem"))
+        .arg("--key")
+        .arg(ctx.identity.join("identity.key"))
+        .arg("--server-ca")
+        .arg(ctx.identity.join("ca.pem"))
+        .arg("--quiet")
+        .arg("--stats");
+
+    let timeout = ctx.cfg.command_timeout(dataset.bytes);
+    let run = run_timed("cftp put", put, timeout)?;
+    if !run.status.success() {
+        return Err(format!(
+            "cftp put to {endpoint} failed ({}): {}",
+            run.status,
+            brief(&run.stderr)
+        ));
+    }
+    report_transport(&dataset.name, &run.stdout);
+    Ok(run.elapsed)
+}
+
+/// Echoes the `stats:` line printed by `cftp put --stats`, when present.
+fn report_transport(dataset: &str, stdout: &str) {
+    for line in stdout.lines().filter(|line| line.starts_with("stats: ")) {
+        eprintln!("{dataset}: cftp {line}");
+    }
 }
 
 fn measure_copy_dir(ctx: &Ctx<'_>, dataset: &Dataset) -> Result<Vec<Duration>, String> {
@@ -1714,7 +1806,17 @@ fn run() -> Result<(), String> {
     } else {
         temp.path().to_path_buf()
     };
-    let identity = workspace.join("identity");
+    let identity = match (&cfg.endpoint, &cfg.cert_dir) {
+        (Some(_), Some(dir)) => dir.clone(),
+        (Some(_), None) => {
+            cftp_core::identity::IdentityPaths::user()
+                .map_err(|err| {
+                    format!("could not locate the default certificate directory: {err}")
+                })?
+                .dir
+        }
+        (None, _) => workspace.join("identity"),
+    };
     let datasets_base = workspace.join("datasets");
     let runs = workspace.join("runs");
     fs::create_dir_all(&datasets_base)
@@ -1722,7 +1824,10 @@ fn run() -> Result<(), String> {
     fs::create_dir_all(&runs)
         .map_err(|err| format!("failed to create {}: {err}", runs.display()))?;
 
-    init_identity(&cftp, &identity)?;
+    if cfg.endpoint.is_none() {
+        init_identity(&cftp, &identity)?;
+    }
+    eprintln!("certificates: {}", identity.display());
 
     let mut datasets = Vec::new();
     for name in &cfg.datasets {
@@ -1738,6 +1843,12 @@ fn run() -> Result<(), String> {
     }
 
     let mut notes = Notes::default();
+    if let Some(endpoint) = &cfg.endpoint {
+        notes.push(format!(
+            "cftp: measured against {endpoint}; received files were not verified and were \
+             not removed from the server"
+        ));
+    }
     let tools = detect_tools(&cfg, &mut notes);
     let ctx = Ctx {
         cfg: &cfg,

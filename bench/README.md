@@ -72,6 +72,26 @@ The server's startup and readiness wait are excluded from `cftp put` timing.
 Server startup still adds to the harness's total wall-clock time, and each
 iteration starts a new server.
 
+### Against a running server
+
+`--endpoint HOST:PORT` (or `CFTP_BENCH_ENDPOINT`) measures cftp against a
+server that is already running, which is how to include a real network path:
+
+```sh
+cargo run --release -p cftp-cli --example bench -- \
+  --endpoint 192.0.2.10:4433 --cert-dir ~/.config/cftp --iterations 3
+```
+
+No server is spawned and no identity is generated. The client presents
+`identity.pem` and `identity.key` from `--cert-dir` (`CFTP_BENCH_CERT_DIR`,
+default `~/.config/cftp`) and verifies the server with `ca.pem`, so both peers
+must trust the same CA. Each iteration uploads to
+`cftp-bench-<pid>-<dataset>-<iteration>` under the server root, preserving the
+source directory name. Received bytes are **not** verified and are left on the
+server: the harness has no command channel to the peer. Point `--ssh-target`
+at the same host to compare against `scp` on that path, and remove the uploads
+yourself.
+
 ## Optional external comparisons
 
 ### scp
@@ -204,5 +224,7 @@ table and the run still exits zero.
 | `--ssh-dest`          | `CFTP_BENCH_SSH_DEST`         | Remote parent directory for scp (default `/tmp`)     |
 | `--ftp-url`           | `CFTP_BENCH_FTP_URL`          | Enable FTP uploads to this base URL                  |
 | `--http-url`          | `CFTP_BENCH_HTTP_URL`         | Download `large.bin` from this base URL              |
+| `--endpoint <ADDR>`   | `CFTP_BENCH_ENDPOINT`         | Measure cftp against a running server at `HOST:PORT` |
+| `--cert-dir <DIR>`    | `CFTP_BENCH_CERT_DIR`         | Certificate directory for `--endpoint`               |
 | `--timeout <SECS>`    |                               | Per-command timeout (default scales with size)       |
 | `--keep`              |                               | Keep the temporary workspace                         |
