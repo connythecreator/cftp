@@ -240,7 +240,7 @@ pub fn from_private_key(private: ssh_key::PrivateKey) -> Result<SshPrivateKey> {
 fn private_key_to_pkcs8(data: &KeypairData) -> Result<PrivateKeyDer<'static>> {
     let der = match data {
         KeypairData::Ed25519(key) => {
-            let signing = ed25519_dalek::SigningKey::from(&key.private);
+            let signing = ed25519_dalek::SigningKey::from_bytes(&key.private.to_bytes());
             ed25519_dalek::pkcs8::EncodePrivateKey::to_pkcs8_der(&signing)
                 .context("failed to encode Ed25519 key as PKCS#8")?
                 .as_bytes()
